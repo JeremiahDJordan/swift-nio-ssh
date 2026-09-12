@@ -578,13 +578,16 @@ struct SSHKeyExchangeStateMachine {
     }
 
     /// The encryption algorithms supported by this peer, in order of preference.
+    ///
+    /// Several protection schemes may share a cipher (e.g. `aes256-ctr` with two
+    /// MACs); the KEXINIT name-list carries each name once, first occurrence wins.
     private var supportedEncryptionAlgorithms: [Substring] {
-        self.protectionSchemes.map { Substring($0.cipherName) }
+        self.protectionSchemes.map { Substring($0.cipherName) }.removingDuplicates()
     }
 
     /// The MAC algorithms supported by this peer, in order of preference.
     private var supportedMacAlgorithms: [Substring] {
-        let schemes = self.protectionSchemes.compactMap { $0.macName.map { Substring($0) } }
+        let schemes = self.protectionSchemes.compactMap { $0.macName.map { Substring($0) } }.removingDuplicates()
 
         // RFC 4253 requires KEXINIT algorithm name-lists to contain at least one algorithm name.
         // OpenSSH-style AEAD ciphers ignore MAC negotiation, but still need a compatibility MAC proposal.
@@ -677,5 +680,13 @@ extension CSPRNG {
         buffer.writeInteger(self.next())
         assert(buffer.readableBytes == 16)
         return buffer
+    }
+}
+
+extension Array where Element: Hashable {
+    /// Order-preserving de-duplication.
+    fileprivate func removingDuplicates() -> [Element] {
+        var seen = Set<Element>()
+        return self.filter { seen.insert($0).inserted }
     }
 }
