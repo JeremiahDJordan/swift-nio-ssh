@@ -317,12 +317,11 @@ extension NIOSSHCertifiedPublicKey {
             throw NIOSSHError.invalidCertificate(diagnostics: "Certificate is not valid for this principal")
         }
 
-        // This can only be negative if we're in a terribly misconfigured system, so we can safely just turn this directly
-        // into a UInt64.
-        let now = DispatchWallTime.now()
-        let validAfter = DispatchWallTime(secondsSinceEpoch: self.validAfter)
-        let validBefore = DispatchWallTime(secondsSinceEpoch: self.validBefore)
-        guard validAfter <= now, validBefore > now else {
+        // Compare epoch seconds directly: OpenSSH encodes "valid forever" as 0xFFFFFFFFFFFFFFFF
+        // (ssh-keygen without -V), which does not fit in a time_t, so going through
+        // DispatchWallTime/timespec would trap on every such certificate.
+        let now = UInt64(max(0, Date().timeIntervalSince1970))
+        guard self.validAfter <= now, self.validBefore > now else {
             throw NIOSSHError.invalidCertificate(diagnostics: "Certificate is no longer valid")
         }
 
@@ -745,9 +744,3 @@ extension ByteBuffer {
     }
 }
 
-extension DispatchWallTime {
-    init(secondsSinceEpoch: UInt64) {
-        let t = timespec(tv_sec: time_t(secondsSinceEpoch), tv_nsec: 0)
-        self = DispatchWallTime(timespec: t)
-    }
-}

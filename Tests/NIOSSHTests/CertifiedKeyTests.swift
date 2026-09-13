@@ -66,6 +66,11 @@ private enum Fixtures {
     static let p384HostExport =
         "ecdsa-sha2-nistp384-cert-v01@openssh.com AAAAKGVjZHNhLXNoYTItbmlzdHAzODQtY2VydC12MDFAb3BlbnNzaC5jb20AAAAgvD8+H64ZEuPHwYIxuym9XHVpiJEoCvCqyy8Ch7JAZEgAAAAIbmlzdHAzODQAAABhBJPOgAXHijSxoZBiyhSDOR3eUELUoc+hqh/SY1Wq4/562jThf6Q+tjVzZTMWZMAP4S6DD2qZswsRvisxXkcZDOw5bvyk0WmezYvjUP6TZII/0BDVTotCf4SxukEtcqBZqgAAAAAAAAIfAAAAAgAAAA1Ib3N0IFAzODQga2V5AAAAHAAAAAlsb2NhbGhvc3QAAAALZXhhbXBsZS5jb20AAAAAXtfWGQAAAAC8kfpVAAAAFAAAAARjYXRzAAAACAAAAARkb2dzAAAALgAAAARsZW5zAAAACAAAAAR3aWRlAAAABHNpemUAAAAOAAAACmZ1bGwtZnJhbWUAAAAAAAAAiAAAABNlY2RzYS1zaGEyLW5pc3RwMzg0AAAACG5pc3RwMzg0AAAAYQR2JTEl2nF7dd6AS6TFxD9DkjMOaJHeXOxt4aIptTEf0x1DsjktgFUChKi2bPrXd2OsmAq6uUxlgzRmNnXyhV/fZy6iQqtpMUf/wj91IXq5GZ5+ruHluG4iy+8Tg6jTs5EAAACEAAAAE2VjZHNhLXNoYTItbmlzdHAzODQAAABpAAAAMH0U5Rb7TVXX4TP1T1keRioun8qUwsynDX9HHJ/lxgQVdpv3rK/8JVRYE3iEhs8gCwAAADEAp+ljZpPr60aE5l0Q1KrLv5/gfEbYasXBdnSbO47qnAYRg+6VuEb+GGiG9ZAXsq5G"
 
+    // An ed25519 host certificate with no validity window: ssh-keygen -s ca -I forever-host -h -n localhost,example.com host.pub
+    static let foreverCA = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINTwV63oCVLFXHHHVGUP2g4bNLEOEiHVhfM3iVi0j8ax ca"
+    static let foreverHost =
+        "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIGjni3IgMfNPnCvq9D18yCTDFt96DDtIJbKDb/4HUTGWAAAAIIVbYIr/puQ3aNHTVzC9kHEd27OxcGn4L//1eZw7Gh4TAAAAAAAAAAAAAAACAAAADGZvcmV2ZXItaG9zdAAAABwAAAAJbG9jYWxob3N0AAAAC2V4YW1wbGUuY29tAAAAAAAAAAD//////////wAAAAAAAAAAAAAAAAAAADMAAAALc3NoLWVkMjU1MTkAAAAg1PBXregJUsVcccdUZQ/aDhs0sQ4SIdWF8zeJWLSPxrEAAABTAAAAC3NzaC1lZDI1NTE5AAAAQJOBUbdAfG8iOylDQWj7rlaP1FMuFg86ixnDQEfFxdQoO6NZleWa1HO4X0h25bRjk4qArCN6HHUuX6k2iw2+sAI= host"
+
     static let ed25519UserBase =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJfkNV4OS33ImTXvorZr72q4v5XhVEQKfvqsxOEJ/XaR lukasa@MacBook-Pro.local"
 
@@ -339,6 +344,22 @@ final class CertifiedKeyTests: XCTestCase {
         ) { error in
             XCTAssertEqual((error as? NIOSSHError)?.type, .invalidCertificate)
         }
+    }
+
+    func testNeverExpiringHostCertificateValidates() throws {
+        // ssh-keygen without -V writes validBefore = 0xFFFFFFFFFFFFFFFF ("Valid: forever"),
+        // which is what every ordinary `HostCertificate` carries. This used to trap in
+        // time_t conversion.
+        let caKey = try NIOSSHPublicKey(openSSHPublicKey: Fixtures.foreverCA)
+        let hostKey = try NIOSSHCertifiedPublicKey(NIOSSHPublicKey(openSSHPublicKey: Fixtures.foreverHost))!
+        XCTAssertEqual(hostKey.validAfter, 0)
+        XCTAssertEqual(hostKey.validBefore, UInt64.max)
+        XCTAssertNoThrow(try hostKey.validate(principal: "localhost", type: .host, allowedAuthoritySigningKeys: [caKey]))
+        XCTAssertNoThrow(try hostKey.validate(principal: "example.com", type: .host, allowedAuthoritySigningKeys: [caKey]))
+        XCTAssertThrowsError(try hostKey.validate(principal: "other", type: .host, allowedAuthoritySigningKeys: [caKey])) { error in
+            XCTAssertEqual((error as? NIOSSHError)?.type, .invalidCertificate)
+        }
+        XCTAssertThrowsError(try hostKey.validate(principal: "localhost", type: .user, allowedAuthoritySigningKeys: [caKey]))
     }
 
     func testKeysNotYetValidFailValidation() throws {
