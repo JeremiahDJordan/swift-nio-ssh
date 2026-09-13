@@ -88,10 +88,19 @@ extension NIOSSHError {
         NIOSSHError(type: .protocolViolation, diagnostics: "Protocol \(protocolName) violated due to \(violation)")
     }
 
+    /// A negotiation failure with no further detail. Prefer
+    /// ``keyExchangeNegotiationFailure(reason:)``: without diagnostics every
+    /// negotiation failure is indistinguishable, so a client cannot tell the user
+    /// whether the host key, the cipher or the MAC had no mutual algorithm.
     internal static let keyExchangeNegotiationFailure = NIOSSHError(
         type: .keyExchangeNegotiationFailure,
         diagnostics: nil
     )
+
+    @inline(never)
+    internal static func keyExchangeNegotiationFailure(reason: String) -> NIOSSHError {
+        NIOSSHError(type: .keyExchangeNegotiationFailure, diagnostics: reason)
+    }
 
     @inline(never)
     internal static func unsupportedVersion(_ version: String) -> NIOSSHError {

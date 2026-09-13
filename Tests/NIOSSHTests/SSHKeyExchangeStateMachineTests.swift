@@ -798,6 +798,75 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         XCTAssertTrue(clientInboundProtection is AES128GCMOpenSSHTransportProtection)
     }
 
+    /// A negotiation failure must say *what* had no mutual algorithm. Without diagnostics
+    /// every one of them stringifies to the same "NIOSSHError.keyExchangeNegotiationFailure",
+    /// so a client cannot tell the user "this server offers an RSA host key only" from
+    /// "this server offers no cipher we implement".
+    func testNegotiationFailuresCarryDiagnostics() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+
+        func client(_ schemes: [NIOSSHTransportProtection.Type]) -> SSHKeyExchangeStateMachine {
+            SSHKeyExchangeStateMachine(
+                allocator: allocator,
+                loop: loop,
+                role: .client(
+                    .init(userAuthDelegate: ExplodingAuthDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+                ),
+                remoteVersion: Constants.version,
+                protectionSchemes: schemes,
+                previousSessionIdentifier: nil
+            )
+        }
+
+        func failure(
+            _ machine: inout SSHKeyExchangeStateMachine,
+            _ peer: SSHMessage.KeyExchangeMessage,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) -> String {
+            var description = ""
+            XCTAssertThrowsError(try machine.handle(keyExchange: peer), file: file, line: line) { error in
+                guard let error = error as? NIOSSHError else {
+                    return XCTFail("not a NIOSSHError: \(error)", file: file, line: line)
+                }
+                XCTAssertEqual(error.type, .keyExchangeNegotiationFailure, file: file, line: line)
+                description = error.description
+            }
+            return description
+        }
+
+        // A server offering only an RSA host key: the diagnostics must name the host key.
+        var hostKeyClient = client([AES128GCMOpenSSHTransportProtection.self])
+        let ourMessage = hostKeyClient.createKeyExchangeMessage()
+        hostKeyClient.send(keyExchange: ourMessage)
+        var rsaOnly = ourMessage
+        rsaOnly.serverHostKeyAlgorithms = ["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"]
+        let hostKeyFailure = failure(&hostKeyClient, rsaOnly)
+        XCTAssertTrue(hostKeyFailure.lowercased().contains("host key"), hostKeyFailure)
+        XCTAssertTrue(hostKeyFailure.contains("rsa-sha2-512"), hostKeyFailure)
+
+        // A server offering no cipher we implement: the diagnostics must name the cipher.
+        var cipherClient = client([AES128GCMOpenSSHTransportProtection.self])
+        let cipherOurs = cipherClient.createKeyExchangeMessage()
+        cipherClient.send(keyExchange: cipherOurs)
+        var noCipher = cipherOurs
+        noCipher.encryptionAlgorithmsClientToServer = ["3des-cbc"]
+        noCipher.encryptionAlgorithmsServerToClient = ["3des-cbc"]
+        let cipherFailure = failure(&cipherClient, noCipher)
+        XCTAssertTrue(cipherFailure.lowercased().contains("cipher"), cipherFailure)
+
+        // A shared cipher but no shared MAC for it.
+        var macClient = client([SharedCipherFirstMACTransportProtection.self])
+        let macOurs = macClient.createKeyExchangeMessage()
+        macClient.send(keyExchange: macOurs)
+        var noMAC = macOurs
+        noMAC.macAlgorithmsClientToServer = ["hmac-md5"]
+        noMAC.macAlgorithmsServerToClient = ["hmac-md5"]
+        let macFailure = failure(&macClient, noMAC)
+        XCTAssertTrue(macFailure.lowercased().contains("mac"), macFailure)
+    }
+
     func testNeitherRoleAdvertisesCertificateHostKeyAlgorithms() throws {
         // Fork: `2022583` made the client prefer *-cert-v01 so a HostCertificate server would
         // present its certificate. Reverted — NIOSSH parses the certified key during key

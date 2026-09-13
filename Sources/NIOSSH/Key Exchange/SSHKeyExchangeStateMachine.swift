@@ -395,7 +395,9 @@ struct SSHKeyExchangeStateMachine {
 
         // We only support symmetrical negotiation results.
         guard ObjectIdentifier(clientProtection) == ObjectIdentifier(serverProtection) else {
-            throw NIOSSHError.keyExchangeNegotiationFailure
+            throw NIOSSHError.keyExchangeNegotiationFailure(
+                reason: "no cipher/MAC scheme that both directions can share"
+            )
         }
 
         // Great, we have a protection scheme. Build the negotiation result.
@@ -472,7 +474,11 @@ struct SSHKeyExchangeStateMachine {
         }
 
         // Completed the loop with usable protocols, we have to throw.
-        throw NIOSSHError.keyExchangeNegotiationFailure
+        throw NIOSSHError.keyExchangeNegotiationFailure(
+            reason:
+                "no mutual key exchange algorithm and host key algorithm (peer host keys: "
+                + peerHostKeyAlgorithms.joined(separator: ",") + ")"
+        )
     }
 
     private func negotiatedTransportProtection(
@@ -514,7 +520,9 @@ struct SSHKeyExchangeStateMachine {
             }
 
             guard let mac = clientMACAlgorithms.first(where: { serverMACAlgorithms.contains($0) }) else {
-                throw NIOSSHError.keyExchangeNegotiationFailure
+                throw NIOSSHError.keyExchangeNegotiationFailure(
+                    reason: "no mutual MAC algorithm for cipher \(encryption)"
+                )
             }
 
             // MAC negotiation is independent in RFC 4253. Once the first mutual MAC is selected, both
@@ -523,13 +531,17 @@ struct SSHKeyExchangeStateMachine {
             guard let scheme = self.protectionSchemes.first(where: {
                 $0.cipherName == encryption && $0.macName == String(mac)
             }) else {
-                throw NIOSSHError.keyExchangeNegotiationFailure
+                throw NIOSSHError.keyExchangeNegotiationFailure(
+                    reason: "no scheme for the negotiated cipher \(encryption) with MAC \(mac)"
+                )
             }
 
             return scheme
         }
 
-        throw NIOSSHError.keyExchangeNegotiationFailure
+        throw NIOSSHError.keyExchangeNegotiationFailure(
+            reason: "no mutual encryption algorithm (cipher)"
+        )
     }
 
     private mutating func addKeyExchangeInitMessagesToExchangeBytes(
@@ -557,7 +569,9 @@ struct SSHKeyExchangeStateMachine {
         }
 
         // Huh, we didn't find it. Weird error.
-        throw NIOSSHError.keyExchangeNegotiationFailure
+        throw NIOSSHError.keyExchangeNegotiationFailure(
+            reason: "no implementation for the negotiated key exchange algorithm \(algorithm)"
+        )
     }
 
     private func expectingIncorrectGuess(_ kexMessage: SSHMessage.KeyExchangeMessage) -> Bool {
