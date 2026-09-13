@@ -614,16 +614,24 @@ extension SSHKeyExchangeStateMachine {
 
     /// The host key algorithms the client role advertises, in order of preference.
     ///
-    /// Client role: prefer `*-cert-v01@openssh.com` so a server with a `HostCertificate`
-    /// presents it; the plain algorithm follows immediately as the fallback. This list
-    /// governs host-key verification during key exchange, not user authentication. The
-    /// server role does not advertise certificate algorithms (a `NIOSSHPrivateKey`
-    /// carries no certificate, so it could not present one).
+    /// Plain key types only. `*-cert-v01@openssh.com` was advertised here for a while
+    /// (fork commit `2022583`) so that a server with a `HostCertificate` would present
+    /// it, but NIOSSH parses a certified key eagerly and cannot represent an `ssh-rsa`
+    /// CA: a host whose certificate is signed by an RSA CA (the Vault/Teleport default)
+    /// became unreachable with `NIOSSHError.unknownPublicKey: ssh-rsa` thrown from key
+    /// exchange, before any host-key delegate could demote it to the inner key. Asking
+    /// for certificates also bought nothing: NIOSSH never verifies them, and ChatShell
+    /// pins the inner key regardless. Servers offer the plain type alongside the
+    /// certificate, so dropping the certificate names simply selects the plain key.
+    ///
+    /// This list governs host-key verification during key exchange, not user
+    /// authentication. The server role does not advertise certificate algorithms
+    /// either (a `NIOSSHPrivateKey` carries no certificate, so it could not present one).
     static let supportedServerHostKeyAlgorithms: [Substring] = [
-        "ssh-ed25519-cert-v01@openssh.com", "ssh-ed25519",
-        "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp384",
-        "ecdsa-sha2-nistp256-cert-v01@openssh.com", "ecdsa-sha2-nistp256",
-        "ecdsa-sha2-nistp521-cert-v01@openssh.com", "ecdsa-sha2-nistp521",
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp521",
     ]
 }
 

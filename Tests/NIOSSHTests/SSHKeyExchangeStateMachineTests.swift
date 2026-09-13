@@ -798,9 +798,12 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         XCTAssertTrue(clientInboundProtection is AES128GCMOpenSSHTransportProtection)
     }
 
-    func testClientAdvertisesCertificateHostKeyAlgorithmsBeforeEachBaseType() throws {
-        // Fork commit 2022583: the client prefers *-cert-v01 so a HostCertificate server presents
-        // its certificate; each plain type follows its certificate form as the fallback.
+    func testNeitherRoleAdvertisesCertificateHostKeyAlgorithms() throws {
+        // Fork: `2022583` made the client prefer *-cert-v01 so a HostCertificate server would
+        // present its certificate. Reverted — NIOSSH parses the certified key during key
+        // exchange and cannot represent an `ssh-rsa` CA, so a host certificate signed by an RSA
+        // CA failed the handshake outright (`unknownPublicKey: ssh-rsa`) instead of falling back
+        // to the plain host key the same server also offers. Both roles advertise plain types.
         let client = SSHKeyExchangeStateMachine(
             allocator: ByteBufferAllocator(),
             loop: EmbeddedEventLoop(),
@@ -815,18 +818,15 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         XCTAssertEqual(
             message.serverHostKeyAlgorithms,
             [
-                "ssh-ed25519-cert-v01@openssh.com", "ssh-ed25519",
-                "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp384",
-                "ecdsa-sha2-nistp256-cert-v01@openssh.com", "ecdsa-sha2-nistp256",
-                "ecdsa-sha2-nistp521-cert-v01@openssh.com", "ecdsa-sha2-nistp521",
+                "ssh-ed25519",
+                "ecdsa-sha2-nistp384",
+                "ecdsa-sha2-nistp256",
+                "ecdsa-sha2-nistp521",
             ]
         )
-        let algorithms = message.serverHostKeyAlgorithms
-        for (index, algorithm) in algorithms.enumerated() where algorithm.hasSuffix("-cert-v01@openssh.com") {
-            XCTAssertEqual(algorithms[index + 1] + "-cert-v01@openssh.com", algorithm, "\(algorithm) must be followed by its base type")
-        }
+        XCTAssertFalse(message.serverHostKeyAlgorithms.contains { $0.hasSuffix("-cert-v01@openssh.com") })
 
-        // The server role never advertises certificate algorithms.
+        // The server role never advertises certificate algorithms either.
         let server = SSHKeyExchangeStateMachine(
             allocator: ByteBufferAllocator(),
             loop: EmbeddedEventLoop(),
