@@ -46,6 +46,12 @@ struct SSHPacketParser {
     /// for the SSH framing and padding (RFC 4253 §6) that wraps a maximum-size channel data payload.
     private let maximumEncryptedPacketLength: UInt32
 
+    /// Whether strict key exchange is in force on this connection. Set the first time
+    /// encryption is installed with a sequence-number reset, and read back when a rekey
+    /// builds a fresh `SSHKeyExchangeStateMachine` (the mode is negotiated once, in the
+    /// connection's first KEXINIT, and holds for its lifetime).
+    private(set) var strictKeyExchange = false
+
     /// The number of preamble lines a client has discarded while waiting for the identification
     /// string, bounded by `maximumPreambleLineCount`.
     private var preambleLineCount: Int
@@ -84,7 +90,12 @@ struct SSHPacketParser {
     /// Encryption schemes can be added to a packet parser whenever encryption is negotiated.
     /// They must be added monotonically, and may only be added once, while the parser is in an
     /// idle state.
-    mutating func addEncryption(_ protection: NIOSSHTransportProtection) {
+    ///
+    /// With strict key exchange (`kex-strict-{c,s}-v00@openssh.com`) the receive sequence
+    /// number is reset to zero as SSH_MSG_NEWKEYS is processed, which is what removes the
+    /// attacker's ability to prepend or delete packets before the secure channel starts
+    /// (Terrapin, CVE-2023-48795).
+    mutating func addEncryption(_ protection: NIOSSHTransportProtection, resetSequenceNumber: Bool = false) {
         switch self.state {
         case .cleartextWaitingForLength:
             self.state = .encryptedWaitingForLength(protection)
@@ -92,6 +103,10 @@ struct SSHPacketParser {
             self.state = .encryptedWaitingForLength(protection)
         case .cleartextWaitingForBytes, .initialized, .encryptedWaitingForBytes:
             preconditionFailure("Adding encryption in invalid state: \(self.state)")
+        }
+        if resetSequenceNumber {
+            self.sequenceNumber = 0
+            self.strictKeyExchange = true
         }
     }
 

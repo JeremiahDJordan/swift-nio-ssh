@@ -25,7 +25,10 @@ struct SSHPacketSerializer {
     private(set) var sequenceNumber: UInt32 = 0
 
     /// Encryption schemes can be added to a packet serializer whenever encryption is negotiated.
-    mutating func addEncryption(_ protection: NIOSSHTransportProtection) {
+    ///
+    /// With strict key exchange the send sequence number is reset to zero once
+    /// SSH_MSG_NEWKEYS has been serialized (see `SSHPacketParser.addEncryption`).
+    mutating func addEncryption(_ protection: NIOSSHTransportProtection, resetSequenceNumber: Bool = false) {
         switch self.state {
         case .cleartext:
             self.state = .encrypted(protection)
@@ -33,6 +36,9 @@ struct SSHPacketSerializer {
             self.state = .encrypted(protection)
         case .initialized:
             preconditionFailure("Adding encryption in invalid state: \(self.state)")
+        }
+        if resetSequenceNumber {
+            self.sequenceNumber = 0
         }
     }
 

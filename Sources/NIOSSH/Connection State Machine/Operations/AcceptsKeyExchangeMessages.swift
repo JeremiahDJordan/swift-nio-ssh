@@ -12,9 +12,24 @@
 //
 //===----------------------------------------------------------------------===//
 
-protocol AcceptsKeyExchangeMessages {
+/// A connection state that is driving a key exchange, whether it is currently sending
+/// or receiving.
+protocol HasKeyExchangeStateMachine {
     var keyExchangeStateMachine: SSHKeyExchangeStateMachine { get set }
+}
 
+extension HasKeyExchangeStateMachine {
+    /// Whether a message that is not part of the key exchange may be processed right now.
+    /// Under strict key exchange nothing but the key exchange messages themselves is
+    /// tolerated during the initial key exchange (OpenSSH PROTOCOL, "strict KEX"), because
+    /// anything tolerated there can be injected or deleted by an attacker to shift the
+    /// packet sequence numbers the transcript is bound to (Terrapin, CVE-2023-48795).
+    var toleratesNonKeyExchangeMessages: Bool {
+        !self.keyExchangeStateMachine.strictKeyExchange
+    }
+}
+
+protocol AcceptsKeyExchangeMessages: HasKeyExchangeStateMachine {
     var parser: SSHPacketParser { get set }
 }
 
@@ -53,6 +68,9 @@ extension AcceptsKeyExchangeMessages {
     mutating func receiveNewKeysMessage() throws {
         // Received a new keys message. Apply the encryption keys to the parser.
         let result = try self.keyExchangeStateMachine.handleNewKeys()
-        self.parser.addEncryption(result)
+        self.parser.addEncryption(
+            result,
+            resetSequenceNumber: self.keyExchangeStateMachine.strictKeyExchange
+        )
     }
 }

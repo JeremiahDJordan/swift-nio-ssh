@@ -38,6 +38,47 @@ final class SSHPacketParserTests: XCTestCase {
         }
     }
 
+    /// Strict key exchange (CVE-2023-48795) resets the inbound sequence number as
+    /// SSH_MSG_NEWKEYS is processed, and only then. Resetting also latches the mode on
+    /// the parser, which is the object that survives every connection state transition
+    /// and therefore carries it into each rekey.
+    func testStrictKeyExchangeResetsTheInboundSequenceNumber() throws {
+        let allocator = ByteBufferAllocator()
+
+        for strict in [false, true] {
+            var serializer = SSHPacketSerializer()
+            var parser = SSHPacketParser(isServer: false, allocator: allocator)
+            self.feedVersion(to: &parser)
+            var versionBuffer = allocator.buffer(capacity: 32)
+            XCTAssertNoThrow(try serializer.serialize(message: .version(Constants.version), to: &versionBuffer))
+
+            for _ in 0..<3 {
+                var buffer = allocator.buffer(capacity: 32)
+                XCTAssertNoThrow(
+                    try serializer.serialize(message: .ignore(.init(data: allocator.buffer(capacity: 0))), to: &buffer)
+                )
+                parser.append(bytes: &buffer)
+                XCTAssertNoThrow(XCTAssertNotNil(try parser.nextPacket()))
+            }
+            XCTAssertEqual(3, parser.sequenceNumber)
+            XCTAssertFalse(parser.strictKeyExchange)
+
+            let protection = try AES128GCMOpenSSHTransportProtection(
+                initialKeys: NIOSSHSessionKeys(
+                    initialInboundIV: .init(randomBytes: 12),
+                    initialOutboundIV: .init(randomBytes: 12),
+                    inboundEncryptionKey: SymmetricKey(size: .bits128),
+                    outboundEncryptionKey: SymmetricKey(size: .bits128),
+                    inboundMACKey: SymmetricKey(size: .bits128),
+                    outboundMACKey: SymmetricKey(size: .bits128)
+                )
+            )
+            parser.addEncryption(protection, resetSequenceNumber: strict)
+            XCTAssertEqual(strict ? 0 : 3, parser.sequenceNumber, "strict: \(strict)")
+            XCTAssertEqual(strict, parser.strictKeyExchange, "strict: \(strict)")
+        }
+    }
+
     func testReadVersion() throws {
         var parser = SSHPacketParser(isServer: false, allocator: ByteBufferAllocator())
 

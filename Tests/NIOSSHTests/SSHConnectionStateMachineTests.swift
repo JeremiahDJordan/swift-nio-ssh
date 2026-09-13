@@ -716,6 +716,81 @@ final class SSHConnectionStateMachineTests: XCTestCase {
         )
     }
 
+    /// Strict key exchange (CVE-2023-48795, "Terrapin"): once both peers propose the
+    /// marker, nothing but the key exchange messages themselves may appear between
+    /// KEXINIT and NEWKEYS. SSH_MSG_IGNORE is the packet the attack injects to shift the
+    /// sequence numbers, and unknown message types reach the same case (this fork maps
+    /// them to SSH_MSG_IGNORE, see docs/FORK.md #224), so both are refused here.
+    func testStrictKeyExchangeRefusesIgnoreDuringKeyExchange() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            )
+        )
+
+        // Version exchange, then each side emits its KEXINIT: both are now mid-key-exchange
+        // and, because both roles propose their strict-KEX marker, both are in strict mode.
+        var clientBuffer = allocator.buffer(capacity: 1024)
+        var serverBuffer = allocator.buffer(capacity: 1024)
+        for message in client.start()! {
+            try client.processOutboundMessage(message, buffer: &clientBuffer, allocator: allocator, loop: loop)
+        }
+        for message in server.start()! {
+            try server.processOutboundMessage(message, buffer: &serverBuffer, allocator: allocator, loop: loop)
+        }
+        client.bufferInboundData(&serverBuffer)
+        server.bufferInboundData(&clientBuffer)
+
+        // Each side reads the peer's version and emits its own KEXINIT.
+        var clientKexInitBytes = allocator.buffer(capacity: 1024)
+        guard case .some(.emitMessage(let clientKexInit)) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("client did not emit its KEXINIT") }
+        for message in clientKexInit {
+            try client.processOutboundMessage(message, buffer: &clientKexInitBytes, allocator: allocator, loop: loop)
+        }
+
+        var serverKexInitBytes = allocator.buffer(capacity: 1024)
+        guard case .some(.emitMessage(let serverKexInit)) = try server.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("server did not emit its KEXINIT") }
+        for message in serverKexInit {
+            try server.processOutboundMessage(message, buffer: &serverKexInitBytes, allocator: allocator, loop: loop)
+        }
+
+        // Deliver both KEXINITs: the strict-KEX markers are now negotiated on both sides.
+        client.bufferInboundData(&serverKexInitBytes)
+        server.bufferInboundData(&clientKexInitBytes)
+        XCTAssertNotNil(try client.processInboundMessage(allocator: allocator, loop: loop))
+        XCTAssertNotNil(try server.processInboundMessage(allocator: allocator, loop: loop))
+
+        // The server now sends SSH_MSG_IGNORE mid-key-exchange. The client must refuse it.
+        var injected = allocator.buffer(capacity: 32)
+        try server.processOutboundMessage(
+            .ignore(.init(data: allocator.buffer(capacity: 0))),
+            buffer: &injected,
+            allocator: allocator,
+            loop: loop
+        )
+        XCTAssertGreaterThan(injected.readableBytes, 0)
+        client.bufferInboundData(&injected)
+        XCTAssertThrowsError(try client.processInboundMessage(allocator: allocator, loop: loop)) { error in
+            XCTAssertEqual((error as? NIOSSHError)?.type, .protocolViolation)
+            XCTAssertTrue(
+                "\(error)".contains("strict key exchange"),
+                "the violation must name strict key exchange: \(error)"
+            )
+        }
+    }
+
     func testUnimplementedGivesARichError() throws {
         let allocator = ByteBufferAllocator()
         let loop = EmbeddedEventLoop()

@@ -43,4 +43,19 @@ public enum Constants: Sendable {
     /// `SSH_MSG_USERAUTH_REQUEST` messages a server processes on a single connection before
     /// disconnecting the client.
     static let defaultMaxAuthAttempts = 1024
+
+    /// Strict key exchange (OpenSSH PROTOCOL, "strict KEX"), the mitigation for the Terrapin
+    /// prefix-truncation attack (CVE-2023-48795).
+    ///
+    /// Each side proposes a pseudo-algorithm in the `kex_algorithms` name-list of its *first*
+    /// KEXINIT. When both do, the mode is on for the life of the connection: packet sequence
+    /// numbers are reset to zero after every SSH_MSG_NEWKEYS, and no message other than the
+    /// key exchange messages themselves is accepted while a key exchange is in progress — so
+    /// an attacker can neither inject nor drop packets before the secure channel starts
+    /// without changing the sequence numbers the transcript is bound to.
+    static let strictKeyExchangeClientMarker: Substring = "kex-strict-c-v00@openssh.com"
+    static let strictKeyExchangeServerMarker: Substring = "kex-strict-s-v00@openssh.com"
+    static let strictKeyExchangeMarkers: [Substring] = [
+        strictKeyExchangeClientMarker, strictKeyExchangeServerMarker,
+    ]
 }

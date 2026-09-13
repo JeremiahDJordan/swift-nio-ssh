@@ -171,7 +171,17 @@ struct SSHConnectionStateMachine {
                         self = .receivedDisconnect(state.role)
                         return .disconnect
                     case .ignore, .debug:
-                        // Ignore these
+                        // Strict key exchange (CVE-2023-48795): during the initial key exchange
+                        // nothing but the key exchange messages themselves may appear, because
+                        // anything tolerated here can be injected by an attacker to shift the
+                        // sequence numbers the transcript is bound to. Unknown message types
+                        // arrive here too (they are treated as SSH_MSG_IGNORE).
+                        guard state.toleratesNonKeyExchangeMessages else {
+                            throw NIOSSHError.protocolViolation(
+                                protocolName: "transport",
+                                violation: "strict key exchange: unexpected \(message) during key exchange"
+                            )
+                        }
                         self = .keyExchange(state)
                         return .noMessage
                     case .unimplemented(let unimplemented):
@@ -230,7 +240,13 @@ struct SSHConnectionStateMachine {
                         self = .receivedDisconnect(state.role)
                         return .disconnect
                     case .ignore, .debug:
-                        // Ignore these
+                        // Strict key exchange: see the `.keyExchange` state above.
+                        guard state.toleratesNonKeyExchangeMessages else {
+                            throw NIOSSHError.protocolViolation(
+                                protocolName: "transport",
+                                violation: "strict key exchange: unexpected \(message) during key exchange"
+                            )
+                        }
                         self = .sentNewKeys(state)
                         return .noMessage
                     case .unimplemented(let unimplemented):
@@ -283,7 +299,14 @@ struct SSHConnectionStateMachine {
                         return .disconnect
 
                     case .ignore, .debug:
-                        // Ignore these
+                        // Strict key exchange: the initial key exchange is not over until both
+                        // sides have sent NEWKEYS, so the same rule applies here.
+                        guard state.toleratesNonKeyExchangeMessages else {
+                            throw NIOSSHError.protocolViolation(
+                                protocolName: "transport",
+                                violation: "strict key exchange: unexpected \(message) during key exchange"
+                            )
+                        }
                         self = .receivedNewKeys(state)
                         return .noMessage
 

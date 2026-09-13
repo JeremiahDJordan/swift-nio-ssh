@@ -93,13 +93,28 @@ struct SSHKeyExchangeStateMachine {
     private var protectionSchemes: [NIOSSHTransportProtection.Type]
     private var previousSessionIdentifier: ByteBuffer?
 
+    /// Whether strict key exchange (`kex-strict-{c,s}-v00@openssh.com`) is in force.
+    ///
+    /// Negotiated in the *first* KEXINIT of a connection and then fixed for its
+    /// lifetime, so a rekey inherits it through the initialiser. See
+    /// ``Constants/strictKeyExchangeClientMarker``.
+    private(set) var strictKeyExchange: Bool
+
+    /// Only the connection's first key exchange may propose or accept the strict-KEX
+    /// markers (OpenSSH PROTOCOL: they are ignored in any later KEXINIT). A rekey is
+    /// exactly the case where we already have a session identifier.
+    private var isInitialKeyExchange: Bool {
+        self.previousSessionIdentifier == nil
+    }
+
     init(
         allocator: ByteBufferAllocator,
         loop: EventLoop,
         role: SSHConnectionRole,
         remoteVersion: String,
         protectionSchemes: [NIOSSHTransportProtection.Type],
-        previousSessionIdentifier: ByteBuffer?
+        previousSessionIdentifier: ByteBuffer?,
+        strictKeyExchange: Bool = false
     ) {
         self.allocator = allocator
         self.loop = loop
@@ -108,6 +123,7 @@ struct SSHKeyExchangeStateMachine {
         self.state = .idle
         self.protectionSchemes = protectionSchemes
         self.previousSessionIdentifier = previousSessionIdentifier
+        self.strictKeyExchange = strictKeyExchange
 
         switch self.role {
         case .client:
@@ -129,7 +145,7 @@ struct SSHKeyExchangeStateMachine {
 
         return .init(
             cookie: rng.randomCookie(allocator: self.allocator),
-            keyExchangeAlgorithms: Self.supportedKeyExchangeAlgorithms,
+            keyExchangeAlgorithms: self.advertisedKeyExchangeAlgorithms,
             serverHostKeyAlgorithms: self.supportedHostKeyAlgorithms,
             encryptionAlgorithmsClientToServer: encryptionAlgorithms,
             encryptionAlgorithmsServerToClient: encryptionAlgorithms,
@@ -144,6 +160,7 @@ struct SSHKeyExchangeStateMachine {
     }
 
     mutating func handle(keyExchange message: SSHMessage.KeyExchangeMessage) throws -> SSHMultiMessage? {
+        self.receiveStrictKeyExchangeMarker(message)
         switch self.state {
         case .keyExchangeSent(message: let ourMessage):
             switch self.role {
@@ -457,6 +474,11 @@ struct SSHKeyExchangeStateMachine {
 
         // Let's find the first protocol the client supports that the server does too.
         for algorithm in clientAlgorithms {
+            // The strict-KEX names are markers, not algorithms: a peer that echoes ours back
+            // must never cause us to "negotiate" one.
+            guard !Constants.strictKeyExchangeMarkers.contains(algorithm) else {
+                continue
+            }
             guard serverAlgorithms.contains(algorithm) else {
                 continue
             }
@@ -624,6 +646,40 @@ extension SSHKeyExchangeStateMachine {
 
     static let supportedKeyExchangeAlgorithms: [Substring] = supportedKeyExchangeImplementations.flatMap {
         $0.keyExchangeAlgorithmNames
+    }
+
+    /// `supportedKeyExchangeAlgorithms` plus this role's strict-KEX marker, which is
+    /// proposed only in a connection's first KEXINIT (OpenSSH PROTOCOL, "strict KEX").
+    /// The marker is part of the KEXINIT payload and therefore of the exchange hash,
+    /// which is what makes the negotiation itself unforgeable.
+    var advertisedKeyExchangeAlgorithms: [Substring] {
+        guard self.isInitialKeyExchange else {
+            return Self.supportedKeyExchangeAlgorithms
+        }
+        switch self.role {
+        case .client:
+            return Self.supportedKeyExchangeAlgorithms + [Constants.strictKeyExchangeClientMarker]
+        case .server:
+            return Self.supportedKeyExchangeAlgorithms + [Constants.strictKeyExchangeServerMarker]
+        }
+    }
+
+    /// Enables strict key exchange when the peer proposed its marker in the connection's
+    /// first KEXINIT. Later KEXINITs cannot turn it on (or off).
+    private mutating func receiveStrictKeyExchangeMarker(_ message: SSHMessage.KeyExchangeMessage) {
+        guard self.isInitialKeyExchange else {
+            return
+        }
+        let peerMarker: Substring
+        switch self.role {
+        case .client:
+            peerMarker = Constants.strictKeyExchangeServerMarker
+        case .server:
+            peerMarker = Constants.strictKeyExchangeClientMarker
+        }
+        if message.keyExchangeAlgorithms.contains(peerMarker) {
+            self.strictKeyExchange = true
+        }
     }
 
     /// The host key algorithms the client role advertises, in order of preference.

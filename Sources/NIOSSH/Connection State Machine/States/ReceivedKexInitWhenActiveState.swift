@@ -47,7 +47,11 @@ extension SSHConnectionStateMachine {
                 role: previous.role,
                 remoteVersion: previous.remoteVersion,
                 protectionSchemes: previous.protectionSchemes,
-                previousSessionIdentifier: self.sessionIdentifier
+                previousSessionIdentifier: self.sessionIdentifier,
+                // Strict key exchange is negotiated once, in the connection's first KEXINIT,
+                // and then holds for its lifetime: the parser is the object that survives
+                // every state transition, so it carries the flag into each rekey.
+                strictKeyExchange: previous.parser.strictKeyExchange
             )
         }
 

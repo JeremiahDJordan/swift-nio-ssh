@@ -867,6 +867,100 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         XCTAssertTrue(macFailure.lowercased().contains("mac"), macFailure)
     }
 
+    // MARK: - Strict key exchange (CVE-2023-48795, "Terrapin")
+
+    private func kexStateMachine(
+        role: SSHConnectionRole,
+        previousSessionIdentifier: ByteBuffer? = nil,
+        strictKeyExchange: Bool = false
+    ) -> SSHKeyExchangeStateMachine {
+        SSHKeyExchangeStateMachine(
+            allocator: ByteBufferAllocator(),
+            loop: EmbeddedEventLoop(),
+            role: role,
+            remoteVersion: Constants.version,
+            protectionSchemes: [AES128GCMOpenSSHTransportProtection.self],
+            previousSessionIdentifier: previousSessionIdentifier,
+            strictKeyExchange: strictKeyExchange
+        )
+    }
+
+    private var clientRole: SSHConnectionRole {
+        .client(.init(userAuthDelegate: ExplodingAuthDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate()))
+    }
+
+    private var serverRole: SSHConnectionRole {
+        .server(.init(hostKeys: [.init(ed25519Key: .init())], userAuthDelegate: DenyAllServerAuthDelegate()))
+    }
+
+    /// The markers go in the *first* KEXINIT only, and each role proposes its own.
+    func testStrictKeyExchangeMarkersAreProposedInTheFirstKexInitOnly() throws {
+        let client = self.kexStateMachine(role: self.clientRole)
+        let clientAlgorithms = client.createKeyExchangeMessage().keyExchangeAlgorithms
+        XCTAssertTrue(clientAlgorithms.contains("kex-strict-c-v00@openssh.com"), "\(clientAlgorithms)")
+        XCTAssertFalse(clientAlgorithms.contains("kex-strict-s-v00@openssh.com"), "\(clientAlgorithms)")
+        XCTAssertEqual(clientAlgorithms.last, "kex-strict-c-v00@openssh.com", "the marker must not displace a real algorithm")
+
+        let server = self.kexStateMachine(role: self.serverRole)
+        let serverAlgorithms = server.createKeyExchangeMessage().keyExchangeAlgorithms
+        XCTAssertTrue(serverAlgorithms.contains("kex-strict-s-v00@openssh.com"), "\(serverAlgorithms)")
+        XCTAssertFalse(serverAlgorithms.contains("kex-strict-c-v00@openssh.com"), "\(serverAlgorithms)")
+
+        // A rekey (which is exactly the case that carries a previous session identifier)
+        // proposes no marker: OpenSSH ignores markers in any KEXINIT after the first.
+        let rekey = self.kexStateMachine(
+            role: self.clientRole,
+            previousSessionIdentifier: ByteBufferAllocator().buffer(string: "session"),
+            strictKeyExchange: true
+        )
+        let rekeyAlgorithms = rekey.createKeyExchangeMessage().keyExchangeAlgorithms
+        XCTAssertFalse(rekeyAlgorithms.contains { $0.hasPrefix("kex-strict-") }, "\(rekeyAlgorithms)")
+        XCTAssertTrue(rekey.strictKeyExchange, "a rekey inherits the negotiated mode")
+    }
+
+    /// Strict key exchange turns on only when the *peer* proposed its marker.
+    func testStrictKeyExchangeIsNegotiatedFromThePeerMarker() throws {
+        var client = self.kexStateMachine(role: self.clientRole)
+        let ourMessage = client.createKeyExchangeMessage()
+        client.send(keyExchange: ourMessage)
+        XCTAssertFalse(client.strictKeyExchange)
+
+        var server = self.kexStateMachine(role: self.serverRole)
+        let serverMessage = server.createKeyExchangeMessage()
+        server.send(keyExchange: serverMessage)
+        _ = try client.handle(keyExchange: serverMessage)
+        XCTAssertTrue(client.strictKeyExchange)
+
+        _ = try server.handle(keyExchange: ourMessage)
+        XCTAssertTrue(server.strictKeyExchange)
+
+        // A peer that does not propose the marker leaves the mode off.
+        var legacyClient = self.kexStateMachine(role: self.clientRole)
+        let legacyOurs = legacyClient.createKeyExchangeMessage()
+        legacyClient.send(keyExchange: legacyOurs)
+        var legacyServerMessage = serverMessage
+        legacyServerMessage.keyExchangeAlgorithms = serverMessage.keyExchangeAlgorithms.filter {
+            !$0.hasPrefix("kex-strict-")
+        }
+        _ = try legacyClient.handle(keyExchange: legacyServerMessage)
+        XCTAssertFalse(legacyClient.strictKeyExchange)
+    }
+
+    /// The marker is a marker, never a key exchange algorithm: a peer that echoes ours
+    /// back must not make us "negotiate" it.
+    func testStrictKeyExchangeMarkerIsNeverNegotiatedAsAnAlgorithm() throws {
+        var client = self.kexStateMachine(role: self.clientRole)
+        let ourMessage = client.createKeyExchangeMessage()
+        client.send(keyExchange: ourMessage)
+
+        var hostile = self.kexStateMachine(role: self.serverRole).createKeyExchangeMessage()
+        // Only the client's own marker, first, and nothing else it could agree on.
+        hostile.keyExchangeAlgorithms = ["kex-strict-c-v00@openssh.com"]
+        XCTAssertThrowsError(try client.handle(keyExchange: hostile)) { error in
+            XCTAssertEqual((error as? NIOSSHError)?.type, .keyExchangeNegotiationFailure)
+        }
+    }
+
     func testNeitherRoleAdvertisesCertificateHostKeyAlgorithms() throws {
         // Fork: `2022583` made the client prefer *-cert-v01 so a HostCertificate server would
         // present its certificate. Reverted — NIOSSH parses the certified key during key

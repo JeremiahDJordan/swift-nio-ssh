@@ -57,6 +57,39 @@ final class SSHPacketSerializerTests: XCTestCase {
         XCTAssertEqual(0, serializer.sequenceNumber)
     }
 
+    /// Strict key exchange (CVE-2023-48795) resets the outbound sequence number as
+    /// SSH_MSG_NEWKEYS is serialized, and only then.
+    func testStrictKeyExchangeResetsTheOutboundSequenceNumber() throws {
+        let allocator = ByteBufferAllocator()
+
+        for strict in [false, true] {
+            var serializer = SSHPacketSerializer()
+            var parser = SSHPacketParser(isServer: false, allocator: allocator)
+            self.runVersionHandshake(serializer: &serializer, parser: &parser)
+
+            var buffer = allocator.buffer(capacity: 64)
+            for _ in 0..<3 {
+                XCTAssertNoThrow(
+                    try serializer.serialize(message: .ignore(.init(data: allocator.buffer(capacity: 0))), to: &buffer)
+                )
+            }
+            XCTAssertEqual(3, serializer.sequenceNumber)
+
+            let protection = try AES128GCMOpenSSHTransportProtection(
+                initialKeys: NIOSSHSessionKeys(
+                    initialInboundIV: .init(randomBytes: 12),
+                    initialOutboundIV: .init(randomBytes: 12),
+                    inboundEncryptionKey: SymmetricKey(size: .bits128),
+                    outboundEncryptionKey: SymmetricKey(size: .bits128),
+                    inboundMACKey: SymmetricKey(size: .bits128),
+                    outboundMACKey: SymmetricKey(size: .bits128)
+                )
+            )
+            serializer.addEncryption(protection, resetSequenceNumber: strict)
+            XCTAssertEqual(strict ? 0 : 3, serializer.sequenceNumber, "strict: \(strict)")
+        }
+    }
+
     func testDisconnectMessage() throws {
         let message = SSHMessage.disconnect(.init(reason: 42, description: "description", tag: "tag"))
         let allocator = ByteBufferAllocator()

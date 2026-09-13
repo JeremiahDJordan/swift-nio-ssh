@@ -14,9 +14,7 @@
 
 import NIOCore
 
-protocol SendsKeyExchangeMessages {
-    var keyExchangeStateMachine: SSHKeyExchangeStateMachine { get set }
-
+protocol SendsKeyExchangeMessages: HasKeyExchangeStateMachine {
     var serializer: SSHPacketSerializer { get set }
 }
 
@@ -48,6 +46,9 @@ extension SendsKeyExchangeMessages {
     mutating func writeNewKeysMessage(into buffer: inout ByteBuffer) throws {
         let result = self.keyExchangeStateMachine.sendNewKeys()
         try self.serializer.serialize(message: .newKeys, to: &buffer)
-        self.serializer.addEncryption(result)
+        self.serializer.addEncryption(
+            result,
+            resetSequenceNumber: self.keyExchangeStateMachine.strictKeyExchange
+        )
     }
 }
