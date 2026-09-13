@@ -40,6 +40,17 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         }
     }
 
+    /// Two schemes sharing a cipher with different MACs (like ChatShell's aes256-ctr + two ETM MACs).
+    final class SharedCipherFirstMACTransportProtection: TestTransportProtection {
+        override class var cipherName: String { "shared-cipher" }
+        override class var macName: String? { "shared-first-mac" }
+    }
+
+    final class SharedCipherSecondMACTransportProtection: TestTransportProtection {
+        override class var cipherName: String { "shared-cipher" }
+        override class var macName: String? { "shared-second-mac" }
+    }
+
     enum AssertionFailure: Error {
         case invalidMessageType
         case unexpectedMultipleMessages
@@ -785,6 +796,117 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
 
         self.assertCompatibleProtection(client: clientInboundProtection, server: serverInboundProtection)
         XCTAssertTrue(clientInboundProtection is AES128GCMOpenSSHTransportProtection)
+    }
+
+    func testClientAdvertisesCertificateHostKeyAlgorithmsBeforeEachBaseType() throws {
+        // Fork commit 2022583: the client prefers *-cert-v01 so a HostCertificate server presents
+        // its certificate; each plain type follows its certificate form as the fallback.
+        let client = SSHKeyExchangeStateMachine(
+            allocator: ByteBufferAllocator(),
+            loop: EmbeddedEventLoop(),
+            role: .client(
+                .init(userAuthDelegate: ExplodingAuthDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            ),
+            remoteVersion: Constants.version,
+            protectionSchemes: [AES128GCMOpenSSHTransportProtection.self],
+            previousSessionIdentifier: nil
+        )
+        let message = client.createKeyExchangeMessage()
+        XCTAssertEqual(
+            message.serverHostKeyAlgorithms,
+            [
+                "ssh-ed25519-cert-v01@openssh.com", "ssh-ed25519",
+                "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp384",
+                "ecdsa-sha2-nistp256-cert-v01@openssh.com", "ecdsa-sha2-nistp256",
+                "ecdsa-sha2-nistp521-cert-v01@openssh.com", "ecdsa-sha2-nistp521",
+            ]
+        )
+        let algorithms = message.serverHostKeyAlgorithms
+        for (index, algorithm) in algorithms.enumerated() where algorithm.hasSuffix("-cert-v01@openssh.com") {
+            XCTAssertEqual(algorithms[index + 1] + "-cert-v01@openssh.com", algorithm, "\(algorithm) must be followed by its base type")
+        }
+
+        // The server role never advertises certificate algorithms.
+        let server = SSHKeyExchangeStateMachine(
+            allocator: ByteBufferAllocator(),
+            loop: EmbeddedEventLoop(),
+            role: .server(.init(hostKeys: [.init(ed25519Key: .init())], userAuthDelegate: DenyAllServerAuthDelegate())),
+            remoteVersion: Constants.version,
+            protectionSchemes: [AES128GCMOpenSSHTransportProtection.self],
+            previousSessionIdentifier: nil
+        )
+        XCTAssertEqual(server.createKeyExchangeMessage().serverHostKeyAlgorithms, ["ssh-ed25519"])
+    }
+
+    func testSchemesSharingACipherAreAdvertisedOnceAndNegotiateEitherMAC() throws {
+        // Fork commit e9d0a77: KEXINIT name-lists carry each cipher/MAC once, first occurrence order.
+        // The client's MAC preference wins (RFC 4253 §7.1), whichever order the server lists them in.
+        let first = SharedCipherFirstMACTransportProtection.self
+        let second = SharedCipherSecondMACTransportProtection.self
+        try self.assertSharedCipherNegotiation(client: [first, second], server: [second, first], expecting: first)
+        try self.assertSharedCipherNegotiation(client: [second, first], server: [first, second], expecting: second)
+    }
+
+    private func assertSharedCipherNegotiation(
+        client clientSchemes: [NIOSSHTransportProtection.Type],
+        server serverSchemes: [NIOSSHTransportProtection.Type],
+        expecting expected: NIOSSHTransportProtection.Type,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHKeyExchangeStateMachine(
+            allocator: allocator,
+            loop: loop,
+            role: .client(
+                .init(userAuthDelegate: ExplodingAuthDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            ),
+            remoteVersion: Constants.version,
+            protectionSchemes: clientSchemes,
+            previousSessionIdentifier: nil
+        )
+        var server = SSHKeyExchangeStateMachine(
+            allocator: allocator,
+            loop: loop,
+            role: .server(.init(hostKeys: [.init(ed25519Key: .init())], userAuthDelegate: DenyAllServerAuthDelegate())),
+            remoteVersion: Constants.version,
+            protectionSchemes: serverSchemes,
+            previousSessionIdentifier: nil
+        )
+
+        let clientMessage = client.createKeyExchangeMessage()
+        let serverMessage = server.createKeyExchangeMessage()
+        let clientMACs = clientSchemes.map { Substring($0.macName!) }
+        let serverMACs = serverSchemes.map { Substring($0.macName!) }
+        XCTAssertEqual(["shared-cipher"], clientMessage.encryptionAlgorithmsClientToServer, file: file, line: line)
+        XCTAssertEqual(["shared-cipher"], clientMessage.encryptionAlgorithmsServerToClient, file: file, line: line)
+        XCTAssertEqual(clientMACs, clientMessage.macAlgorithmsClientToServer, file: file, line: line)
+        XCTAssertEqual(clientMACs, clientMessage.macAlgorithmsServerToClient, file: file, line: line)
+        XCTAssertEqual(["shared-cipher"], serverMessage.encryptionAlgorithmsClientToServer, file: file, line: line)
+        XCTAssertEqual(serverMACs, serverMessage.macAlgorithmsClientToServer, file: file, line: line)
+        XCTAssertEqual(serverMACs, serverMessage.macAlgorithmsServerToClient, file: file, line: line)
+
+        server.send(keyExchange: serverMessage)
+        client.send(keyExchange: clientMessage)
+
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        client.send(keyExchangeInit: ecdhInit)
+
+        let ecdhReply = try assertGeneratesECDHKeyExchangeReplyAndNewKeys(server.handle(keyExchangeInit: ecdhInit))
+        XCTAssertNoThrow(try server.send(keyExchangeReply: ecdhReply), file: file, line: line)
+        let serverOutboundProtection = server.sendNewKeys()
+
+        try self.assertGeneratesNewKeysSynchronously(client.handle(keyExchangeReply: ecdhReply))
+        let clientOutboundProtection = client.sendNewKeys()
+
+        let clientInboundProtection = try assertNoThrowWithValue(client.handleNewKeys())
+        let serverInboundProtection = try assertNoThrowWithValue(server.handleNewKeys())
+        XCTAssertTrue(clientInboundProtection === clientOutboundProtection, file: file, line: line)
+        XCTAssertTrue(serverInboundProtection === serverOutboundProtection, file: file, line: line)
+        XCTAssertTrue(type(of: clientInboundProtection) == expected, "client negotiated \(type(of: clientInboundProtection))", file: file, line: line)
+        XCTAssertTrue(type(of: serverInboundProtection) == expected, "server negotiated \(type(of: serverInboundProtection))", file: file, line: line)
     }
 
     func testMACNegotiationFailsWhenFirstMutualMACHasNoSchemeForSelectedCipher() throws {

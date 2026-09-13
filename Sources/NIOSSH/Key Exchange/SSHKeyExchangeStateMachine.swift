@@ -612,9 +612,13 @@ extension SSHKeyExchangeStateMachine {
         $0.keyExchangeAlgorithmNames
     }
 
-    /// All known host key algorithms.
-    /// Lists both certificate and base algorithms for each key type, matching server behavior.
-    /// Certificate algorithms are listed first to prefer certificate-based authentication.
+    /// The host key algorithms the client role advertises, in order of preference.
+    ///
+    /// Client role: prefer `*-cert-v01@openssh.com` so a server with a `HostCertificate`
+    /// presents it; the plain algorithm follows immediately as the fallback. This list
+    /// governs host-key verification during key exchange, not user authentication. The
+    /// server role does not advertise certificate algorithms (a `NIOSSHPrivateKey`
+    /// carries no certificate, so it could not present one).
     static let supportedServerHostKeyAlgorithms: [Substring] = [
         "ssh-ed25519-cert-v01@openssh.com", "ssh-ed25519",
         "ecdsa-sha2-nistp384-cert-v01@openssh.com", "ecdsa-sha2-nistp384",
