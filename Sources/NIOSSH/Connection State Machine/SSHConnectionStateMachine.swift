@@ -177,10 +177,7 @@ struct SSHConnectionStateMachine {
                         // sequence numbers the transcript is bound to. Unknown message types
                         // arrive here too (they are treated as SSH_MSG_IGNORE).
                         guard state.toleratesNonKeyExchangeMessages else {
-                            throw NIOSSHError.protocolViolation(
-                                protocolName: "transport",
-                                violation: "strict key exchange: unexpected \(message) during key exchange"
-                            )
+                            throw SSHConnectionStateMachine.strictKeyExchangeViolation(message)
                         }
                         self = .keyExchange(state)
                         return .noMessage
@@ -242,10 +239,7 @@ struct SSHConnectionStateMachine {
                     case .ignore, .debug:
                         // Strict key exchange: see the `.keyExchange` state above.
                         guard state.toleratesNonKeyExchangeMessages else {
-                            throw NIOSSHError.protocolViolation(
-                                protocolName: "transport",
-                                violation: "strict key exchange: unexpected \(message) during key exchange"
-                            )
+                            throw SSHConnectionStateMachine.strictKeyExchangeViolation(message)
                         }
                         self = .sentNewKeys(state)
                         return .noMessage
@@ -302,10 +296,7 @@ struct SSHConnectionStateMachine {
                         // Strict key exchange: the initial key exchange is not over until both
                         // sides have sent NEWKEYS, so the same rule applies here.
                         guard state.toleratesNonKeyExchangeMessages else {
-                            throw NIOSSHError.protocolViolation(
-                                protocolName: "transport",
-                                violation: "strict key exchange: unexpected \(message) during key exchange"
-                            )
+                            throw SSHConnectionStateMachine.strictKeyExchangeViolation(message)
                         }
                         self = .receivedNewKeys(state)
                         return .noMessage
@@ -792,14 +783,41 @@ struct SSHConnectionStateMachine {
         }
     }
 
+    /// The message type, and never its contents: `SSH_MSG_DEBUG` carries an
+    /// unbounded, attacker-chosen string sent before authentication, and this
+    /// violation travels verbatim into the application's user-facing connection
+    /// error (`NIOSSHError.description`).
+    private static func strictKeyExchangeViolation(_ message: SSHMessage) -> NIOSSHError {
+        let type: String
+        switch message {
+        case .debug:
+            type = "SSH_MSG_DEBUG"
+        case .ignore:
+            type = "SSH_MSG_IGNORE"
+        default:
+            type = "message"
+        }
+        return NIOSSHError.protocolViolation(
+            protocolName: "transport",
+            violation: "strict key exchange: unexpected \(type) during key exchange"
+        )
+    }
+
     /// The state of this state machine.
     private var state: State
 
     init(
         role: SSHConnectionRole,
-        protectionSchemes: [NIOSSHTransportProtection.Type] = Constants.bundledTransportProtectionSchemes
+        protectionSchemes: [NIOSSHTransportProtection.Type] = Constants.bundledTransportProtectionSchemes,
+        implementsStrictKeyExchange: Bool = true
     ) {
-        self.state = .idle(IdleState(role: role, protectionSchemes: protectionSchemes))
+        self.state = .idle(
+            IdleState(
+                role: role,
+                protectionSchemes: protectionSchemes,
+                implementsStrictKeyExchange: implementsStrictKeyExchange
+            )
+        )
     }
 
     func start() -> SSHMultiMessage? {

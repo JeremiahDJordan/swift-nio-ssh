@@ -28,12 +28,16 @@ extension SSHConnectionStateMachine {
 
         var protectionSchemes: [NIOSSHTransportProtection.Type]
 
+        /// See ``SSHConnectionStateMachine/IdleState``.
+        let implementsStrictKeyExchange: Bool
+
         private let allocator: ByteBufferAllocator
 
         init(idleState state: IdleState, allocator: ByteBufferAllocator) {
             self.role = state.role
             self.serializer = state.serializer
             self.protectionSchemes = state.protectionSchemes
+            self.implementsStrictKeyExchange = state.implementsStrictKeyExchange
 
             self.parser = SSHPacketParser(
                 isServer: self.role.isServer,

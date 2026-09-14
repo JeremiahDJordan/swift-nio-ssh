@@ -295,7 +295,7 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         )
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
         try handleUnexpectedMessageErasingValue(
             message,
             allowedStages: allowedStages,
@@ -303,7 +303,7 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
             stateMachine: &server
         )
 
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         try handleUnexpectedMessageErasingValue(
             message,
             allowedStages: allowedStages,
@@ -410,8 +410,8 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // Now the server receives the ECDH init message and generates the reply, as well as the newKeys message.
@@ -463,7 +463,7 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         var clientMessage = serverMessage
         clientMessage.keyExchangeAlgorithms = ["ecdsa-sha2-1.2.840.10045.3.1.1", "curve25519-sha256"]
         clientMessage.firstKexPacketFollows = true
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
 
         // The server should now tolerate a guess for an invalid message. We shouldn't read it, so the fact that it's invalid is irrelevant.
         let message = SSHMessage.KeyExchangeECDHInitMessage(publicKey: allocator.buffer(capacity: 1024))
@@ -562,9 +562,9 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
 
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // Now the server receives the ECDH init message and generates the reply, as well as the newKeys message.
@@ -630,9 +630,9 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
 
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // Now the server receives the ECDH init message and generates the reply, as well as the newKeys message.
@@ -714,12 +714,12 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // When the server gets the client's message, it's an error.
-        XCTAssertThrowsError(try server.handle(keyExchange: clientMessage)) { error in
+        XCTAssertThrowsError(try server.handle(keyExchange: clientMessage, sequenceNumber: 0)) { error in
             XCTAssertEqual((error as? NIOSSHError)?.type, .keyExchangeNegotiationFailure)
         }
 
         // The same happens when the client receives the server's.
-        XCTAssertThrowsError(try client.handle(keyExchange: serverMessage)) { error in
+        XCTAssertThrowsError(try client.handle(keyExchange: serverMessage, sequenceNumber: 0)) { error in
             XCTAssertEqual((error as? NIOSSHError)?.type, .keyExchangeNegotiationFailure)
         }
     }
@@ -777,8 +777,8 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         server.send(keyExchange: serverMessage)
         client.send(keyExchange: clientMessage)
 
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         let ecdhReply = try assertGeneratesECDHKeyExchangeReplyAndNewKeys(server.handle(keyExchangeInit: ecdhInit))
@@ -826,7 +826,7 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
             line: UInt = #line
         ) -> String {
             var description = ""
-            XCTAssertThrowsError(try machine.handle(keyExchange: peer), file: file, line: line) { error in
+            XCTAssertThrowsError(try machine.handle(keyExchange: peer, sequenceNumber: 0), file: file, line: line) { error in
                 guard let error = error as? NIOSSHError else {
                     return XCTFail("not a NIOSSHError: \(error)", file: file, line: line)
                 }
@@ -928,10 +928,10 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         var server = self.kexStateMachine(role: self.serverRole)
         let serverMessage = server.createKeyExchangeMessage()
         server.send(keyExchange: serverMessage)
-        _ = try client.handle(keyExchange: serverMessage)
+        _ = try client.handle(keyExchange: serverMessage, sequenceNumber: 0)
         XCTAssertTrue(client.strictKeyExchange)
 
-        _ = try server.handle(keyExchange: ourMessage)
+        _ = try server.handle(keyExchange: ourMessage, sequenceNumber: 0)
         XCTAssertTrue(server.strictKeyExchange)
 
         // A peer that does not propose the marker leaves the mode off.
@@ -942,13 +942,34 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         legacyServerMessage.keyExchangeAlgorithms = serverMessage.keyExchangeAlgorithms.filter {
             !$0.hasPrefix("kex-strict-")
         }
-        _ = try legacyClient.handle(keyExchange: legacyServerMessage)
+        _ = try legacyClient.handle(keyExchange: legacyServerMessage, sequenceNumber: 0)
         XCTAssertFalse(legacyClient.strictKeyExchange)
     }
 
     /// The marker is a marker, never a key exchange algorithm: a peer that echoes ours
     /// back must not make us "negotiate" it.
+    ///
+    /// What is actually load-bearing is that the markers live only in
+    /// `advertisedKeyExchangeAlgorithms` — the KEXINIT we *emit* — and never in
+    /// `supportedKeyExchangeAlgorithms`, the list both roles negotiate against. That
+    /// is what this pins. The `Constants.strictKeyExchangeMarkers` guard inside
+    /// `negotiatedKeyExchangeAlgorithm` is defence in depth for the day that changes;
+    /// it cannot alter an outcome today, so neither case below reaches it: the first
+    /// fails for the ordinary "no mutual algorithm" reason, the second succeeds
+    /// because a real algorithm follows the echoed marker.
     func testStrictKeyExchangeMarkerIsNeverNegotiatedAsAnAlgorithm() throws {
+        for role in [self.clientRole, self.serverRole] {
+            let machine = self.kexStateMachine(role: role)
+            XCTAssertTrue(
+                machine.advertisedKeyExchangeAlgorithms.contains { $0.hasPrefix("kex-strict-") },
+                "\(machine.advertisedKeyExchangeAlgorithms)"
+            )
+        }
+        XCTAssertFalse(
+            SSHKeyExchangeStateMachine.supportedKeyExchangeAlgorithms.contains { $0.hasPrefix("kex-strict-") },
+            "a marker in the negotiated list could be selected as an algorithm"
+        )
+
         var client = self.kexStateMachine(role: self.clientRole)
         let ourMessage = client.createKeyExchangeMessage()
         client.send(keyExchange: ourMessage)
@@ -956,9 +977,19 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         var hostile = self.kexStateMachine(role: self.serverRole).createKeyExchangeMessage()
         // Only the client's own marker, first, and nothing else it could agree on.
         hostile.keyExchangeAlgorithms = ["kex-strict-c-v00@openssh.com"]
-        XCTAssertThrowsError(try client.handle(keyExchange: hostile)) { error in
+        XCTAssertThrowsError(try client.handle(keyExchange: hostile, sequenceNumber: 0)) { error in
             XCTAssertEqual((error as? NIOSSHError)?.type, .keyExchangeNegotiationFailure)
         }
+
+        // The marker echoed back ahead of a real algorithm: the real one is chosen and
+        // key exchange proceeds, rather than the marker being "agreed".
+        var second = self.kexStateMachine(role: self.clientRole)
+        second.send(keyExchange: second.createKeyExchangeMessage())
+        var echoing = self.kexStateMachine(role: self.serverRole).createKeyExchangeMessage()
+        echoing.keyExchangeAlgorithms =
+            ["kex-strict-c-v00@openssh.com", "kex-strict-s-v00@openssh.com"]
+            + SSHKeyExchangeStateMachine.supportedKeyExchangeAlgorithms
+        _ = try assertGeneratesECDHKeyExchangeInit(second.handle(keyExchange: echoing, sequenceNumber: 0))
     }
 
     func testNeitherRoleAdvertisesCertificateHostKeyAlgorithms() throws {
@@ -1053,8 +1084,8 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         server.send(keyExchange: serverMessage)
         client.send(keyExchange: clientMessage)
 
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         let ecdhReply = try assertGeneratesECDHKeyExchangeReplyAndNewKeys(server.handle(keyExchangeInit: ecdhInit))
@@ -1112,7 +1143,7 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         XCTAssertEqual("review-first-mac", clientMessage.macAlgorithmsClientToServer.first)
         XCTAssertEqual("review-supported-mac", clientMessage.macAlgorithmsClientToServer.dropFirst().first)
 
-        XCTAssertThrowsError(try server.handle(keyExchange: clientMessage)) { error in
+        XCTAssertThrowsError(try server.handle(keyExchange: clientMessage, sequenceNumber: 0)) { error in
             XCTAssertEqual((error as? NIOSSHError)?.type, .keyExchangeNegotiationFailure)
         }
     }
@@ -1149,8 +1180,8 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // Now the server receives the ECDH init message and generates the reply, as well as the newKeys message.
@@ -1204,9 +1235,9 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server generates a key exchange message in response.
-        let serverMessage = try self.assertGeneratesKeyExchangeMessage(server.handle(keyExchange: clientMessage))
+        let serverMessage = try self.assertGeneratesKeyExchangeMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
         server.send(keyExchange: serverMessage)
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // From here on, the flow is the same as in the regular key exchange.
@@ -1261,7 +1292,7 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         server.send(keyExchange: serverMessage)
 
         // The client generates both a key exchange message and a ecdh key exchange init message.
-        guard let clientMessages = try client.handle(keyExchange: serverMessage) else {
+        guard let clientMessages = try client.handle(keyExchange: serverMessage, sequenceNumber: 0) else {
             XCTFail("Client didn't generate messages")
             return
         }
@@ -1276,7 +1307,7 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchangeInit: clientEcdhInitMessage)
 
         // The server now receives these messages.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientInitMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientInitMessage, sequenceNumber: 0))
 
         // From here on, the flow is the same as in the regular key exchange.
         // Now the server receives the ECDH init message and generates the reply, as well as the newKeys message.
@@ -1349,9 +1380,9 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
 
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // Now the server receives the ECDH init message and generates the reply, as well as the newKeys message.
@@ -1413,9 +1444,9 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
 
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // Now the server receives the ECDH init message and generates the reply. We ignore newKeys here as we
@@ -1477,9 +1508,9 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
 
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // Now the server receives the ECDH init message and generates the reply. We ignore newKeys here as we
@@ -1541,9 +1572,9 @@ final class SSHKeyExchangeStateMachineTests: XCTestCase {
         client.send(keyExchange: clientMessage)
 
         // The server does not generate a response message, but the client does.
-        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage))
+        try self.assertGeneratesNoMessage(server.handle(keyExchange: clientMessage, sequenceNumber: 0))
 
-        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage))
+        let ecdhInit = try assertGeneratesECDHKeyExchangeInit(client.handle(keyExchange: serverMessage, sequenceNumber: 0))
         client.send(keyExchangeInit: ecdhInit)
 
         // Now the server receives the ECDH init message and generates the reply. We ignore newKeys here as we
@@ -1600,7 +1631,7 @@ extension SSHKeyExchangeStateMachineTests {
         self.assertUnexpectedMessage(file: file, line: line) {
             switch message {
             case .keyExchange(let kex):
-                _ = try stateMachine.handle(keyExchange: kex)
+                _ = try stateMachine.handle(keyExchange: kex, sequenceNumber: 0)
             case .keyExchangeInit(let kexInit):
                 _ = try stateMachine.handle(keyExchangeInit: kexInit)
             case .keyExchangeReply(let kexReply):

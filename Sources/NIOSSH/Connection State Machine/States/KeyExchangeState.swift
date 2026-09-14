@@ -50,7 +50,8 @@ extension SSHConnectionStateMachine {
                 role: state.role,
                 remoteVersion: remoteVersion,
                 protectionSchemes: state.protectionSchemes,
-                previousSessionIdentifier: nil
+                previousSessionIdentifier: nil,
+                implementsStrictKeyExchange: state.implementsStrictKeyExchange
             )
         }
 

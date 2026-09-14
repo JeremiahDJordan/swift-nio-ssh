@@ -37,7 +37,15 @@ extension AcceptsKeyExchangeMessages {
     mutating func receiveKeyExchangeMessage(
         _ message: SSHMessage.KeyExchangeMessage
     ) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult {
-        let message = try self.keyExchangeStateMachine.handle(keyExchange: message)
+        // The sequence number of the packet we have just parsed: `nextPacket()` has
+        // already counted it. Strict key exchange requires the peer's first KEXINIT
+        // to *be* packet zero (OpenSSH PROTOCOL, "strict KEX", clause (a)), which is
+        // the half of the rule that catches anything injected before it.
+        let sequenceNumber = self.parser.sequenceNumber &- 1
+        let message = try self.keyExchangeStateMachine.handle(
+            keyExchange: message,
+            sequenceNumber: sequenceNumber
+        )
 
         if let message = message {
             return .emitMessage(message)

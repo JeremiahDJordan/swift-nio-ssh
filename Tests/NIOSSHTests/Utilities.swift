@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 import Crypto
+import NIOConcurrencyHelpers
 import NIOCore
 import XCTest
 
@@ -135,6 +136,23 @@ class TestTransportProtection: NIOSSHTransportProtection {
         nil
     }
 
+    /// Whether the MAC covers the packet's sequence number, as every real
+    /// encrypt-then-MAC scheme's does (`AESCTRETMTransportProtection` MACs
+    /// `seq ‖ length ‖ ciphertext`). The base scheme does not, like AES-GCM, whose
+    /// nonce it keeps itself; `SequenceNumberBoundTransportProtection` does, which is
+    /// what makes an end-to-end test notice a sequence-number desync between the two
+    /// ends — the failure mode strict key exchange's NEWKEYS resets can introduce.
+    class var bindsSequenceNumber: Bool {
+        false
+    }
+
+    private func macInput(_ plaintext: ByteBufferView, sequenceNumber: UInt32) -> [UInt8] {
+        guard Self.bindsSequenceNumber else {
+            return Array(plaintext)
+        }
+        return withUnsafeBytes(of: sequenceNumber.bigEndian) { Array($0) } + Array(plaintext)
+    }
+
     class var keySizes: ExpectedKeySizes {
         .init(ivSize: 12, encryptionKeySize: 16, macKeySize: 16)
     }
@@ -225,11 +243,13 @@ class TestTransportProtection: NIOSSHTransportProtection {
         guard
             HMAC<SHA256>.isValidAuthenticationCode(
                 tagView,
-                authenticating: plaintext.readableBytesView,
+                authenticating: self.macInput(plaintext.readableBytesView, sequenceNumber: sequenceNumber),
                 using: self.inboundMACKey
             )
         else {
-            preconditionFailure("authentication failure")
+            // Thrown, not `preconditionFailure`: a sequence-number desync is a thing a
+            // test needs to be able to observe as a failure rather than a crash.
+            throw NIOSSHError.protocolViolation(protocolName: "transport", violation: "authentication failure")
         }
 
         // First 4 bytes are length
@@ -250,11 +270,41 @@ class TestTransportProtection: NIOSSHTransportProtection {
         assert(ciphertext.readableBytes == encryptedBufferSize)
 
         var hmac = HMAC<SHA256>.init(key: self.outboundMACKey)
-        hmac.update(data: plaintextView)
+        hmac.update(data: self.macInput(plaintextView, sequenceNumber: sequenceNumber))
 
         // We now want to overwrite the portion of the bytebuffer that contains the plaintext with the ciphertext, and then append the tag.
         destination.setBytes(ciphertext.readableBytesView, at: packetLengthIndex)
         let tagLength = destination.writeBytes(hmac.finalize())
         precondition(tagLength == self.macBytes, "Unexpected short tag")
+    }
+}
+
+/// `TestTransportProtection` with the sequence number bound into the MAC, the way
+/// every encrypt-then-MAC scheme binds it. Used to run whole connections so that the
+/// two strict-KEX sequence-number resets (serializer and parser, each end) have to
+/// stay in step for anything to decrypt at all: the fork's other schemes ignore the
+/// parameter (AES-GCM carries its own nonce), so without this no end-to-end test in
+/// the suite can see a desync.
+@available(iOS 13.2, macOS 10.15, watchOS 6.1, tvOS 13.2, *)
+final class SequenceNumberBoundTransportProtection: TestTransportProtection {
+    override class var cipherName: String {
+        "insecure-sequence-number-bound-cipher"
+    }
+
+    override class var bindsSequenceNumber: Bool {
+        true
+    }
+
+    /// Every sequence number this scheme has encrypted with, oldest first, across
+    /// both peers of an in-process test. Two peers that *both* fail to reset at
+    /// NEWKEYS stay in step with each other, so nothing decrypts wrongly and no
+    /// end-to-end assertion can see it — the numbers themselves are the only
+    /// observable, which is what makes this the way to pin the resets a rekey
+    /// under strict key exchange performs.
+    static let encryptedSequenceNumbers = NIOLockedValueBox<[UInt32]>([])
+
+    override func encryptPacket(_ destination: inout ByteBuffer, sequenceNumber: UInt32) throws {
+        Self.encryptedSequenceNumbers.withLockedValue { $0.append(sequenceNumber) }
+        try super.encryptPacket(&destination, sequenceNumber: sequenceNumber)
     }
 }

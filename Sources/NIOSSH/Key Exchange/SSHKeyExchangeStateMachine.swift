@@ -93,6 +93,17 @@ struct SSHKeyExchangeStateMachine {
     private var protectionSchemes: [NIOSSHTransportProtection.Type]
     private var previousSessionIdentifier: ByteBuffer?
 
+    /// Whether this role implements strict key exchange at all: false makes it
+    /// neither propose its marker nor react to the peer's, which is what an
+    /// implementation without the mitigation (Dropbear, libssh, an appliance,
+    /// anything below the OpenSSH backports) looks like on the wire.
+    ///
+    /// Always true in production. The seam exists because both of our roles propose,
+    /// so every NIOSSH-against-NIOSSH connection negotiates strict on both sides and
+    /// the marker-less path — no sequence-number resets, non-key-exchange messages
+    /// tolerated — would otherwise never be exercised end to end.
+    private let implementsStrictKeyExchange: Bool
+
     /// Whether strict key exchange (`kex-strict-{c,s}-v00@openssh.com`) is in force.
     ///
     /// Negotiated in the *first* KEXINIT of a connection and then fixed for its
@@ -114,7 +125,8 @@ struct SSHKeyExchangeStateMachine {
         remoteVersion: String,
         protectionSchemes: [NIOSSHTransportProtection.Type],
         previousSessionIdentifier: ByteBuffer?,
-        strictKeyExchange: Bool = false
+        strictKeyExchange: Bool = false,
+        implementsStrictKeyExchange: Bool = true
     ) {
         self.allocator = allocator
         self.loop = loop
@@ -124,6 +136,7 @@ struct SSHKeyExchangeStateMachine {
         self.protectionSchemes = protectionSchemes
         self.previousSessionIdentifier = previousSessionIdentifier
         self.strictKeyExchange = strictKeyExchange
+        self.implementsStrictKeyExchange = implementsStrictKeyExchange
 
         switch self.role {
         case .client:
@@ -159,8 +172,13 @@ struct SSHKeyExchangeStateMachine {
         )
     }
 
-    mutating func handle(keyExchange message: SSHMessage.KeyExchangeMessage) throws -> SSHMultiMessage? {
-        self.receiveStrictKeyExchangeMarker(message)
+    /// - Parameter sequenceNumber: the sequence number of the packet this KEXINIT
+    ///   arrived in, which strict key exchange constrains on the initial exchange.
+    mutating func handle(
+        keyExchange message: SSHMessage.KeyExchangeMessage,
+        sequenceNumber: UInt32
+    ) throws -> SSHMultiMessage? {
+        try self.receiveStrictKeyExchangeMarker(message, sequenceNumber: sequenceNumber)
         switch self.state {
         case .keyExchangeSent(message: let ourMessage):
             switch self.role {
@@ -653,7 +671,7 @@ extension SSHKeyExchangeStateMachine {
     /// The marker is part of the KEXINIT payload and therefore of the exchange hash,
     /// which is what makes the negotiation itself unforgeable.
     var advertisedKeyExchangeAlgorithms: [Substring] {
-        guard self.isInitialKeyExchange else {
+        guard self.isInitialKeyExchange, self.implementsStrictKeyExchange else {
             return Self.supportedKeyExchangeAlgorithms
         }
         switch self.role {
@@ -666,8 +684,22 @@ extension SSHKeyExchangeStateMachine {
 
     /// Enables strict key exchange when the peer proposed its marker in the connection's
     /// first KEXINIT. Later KEXINITs cannot turn it on (or off).
-    private mutating func receiveStrictKeyExchangeMarker(_ message: SSHMessage.KeyExchangeMessage) {
-        guard self.isInitialKeyExchange else {
+    ///
+    /// With the mode on, the KEXINIT must also be the connection's *first* packet
+    /// (OpenSSH PROTOCOL, "strict KEX": "terminating the connection if the first
+    /// packet received is not SSH2_MSG_KEXINIT"; `kex_input_kexinit` spells it
+    /// `kex->kex_strict && seq != 0`). Without that, an `SSH_MSG_IGNORE` or
+    /// `SSH_MSG_DEBUG` inserted between the version exchange and the KEXINIT is
+    /// still counted by the parser — the message discipline enforced elsewhere only
+    /// switches on once this marker has been read — and shifts the sequence numbers
+    /// the transcript is bound to. The NEWKEYS reset wipes that shift, so this is
+    /// defence in depth; it is also the only line of defence if either reset is ever
+    /// wrong for one direction.
+    private mutating func receiveStrictKeyExchangeMarker(
+        _ message: SSHMessage.KeyExchangeMessage,
+        sequenceNumber: UInt32
+    ) throws {
+        guard self.isInitialKeyExchange, self.implementsStrictKeyExchange else {
             return
         }
         let peerMarker: Substring
@@ -678,6 +710,12 @@ extension SSHKeyExchangeStateMachine {
             peerMarker = Constants.strictKeyExchangeClientMarker
         }
         if message.keyExchangeAlgorithms.contains(peerMarker) {
+            guard sequenceNumber == 0 else {
+                throw NIOSSHError.protocolViolation(
+                    protocolName: "transport",
+                    violation: "strict key exchange: KEXINIT was not the first packet"
+                )
+            }
             self.strictKeyExchange = true
         }
     }

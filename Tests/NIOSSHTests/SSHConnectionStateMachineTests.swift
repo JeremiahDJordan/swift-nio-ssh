@@ -791,6 +791,350 @@ final class SSHConnectionStateMachineTests: XCTestCase {
         }
     }
 
+    /// A `SSH_MSG_DEBUG` is attacker-chosen text sent before authentication, and the
+    /// violation string reaches the application's user-facing error. Name the message
+    /// type, never its contents.
+    func testStrictKeyExchangeViolationDoesNotQuoteThePeersText() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            )
+        )
+        try self.exchangeVersionsAndKexInits(
+            client: &client,
+            server: &server,
+            allocator: allocator,
+            loop: loop
+        )
+
+        let secret = "CANARY-e6b1f0-\u{1b}[2J\nTrusted"
+        var injected = allocator.buffer(capacity: 128)
+        try server.processOutboundMessage(
+            .debug(.init(alwaysDisplay: true, message: secret, language: "en")),
+            buffer: &injected,
+            allocator: allocator,
+            loop: loop
+        )
+        client.bufferInboundData(&injected)
+        XCTAssertThrowsError(try client.processInboundMessage(allocator: allocator, loop: loop)) { error in
+            let rendered = "\(error)"
+            XCTAssertTrue(rendered.contains("strict key exchange"), rendered)
+            XCTAssertTrue(rendered.contains("SSH_MSG_DEBUG"), rendered)
+            XCTAssertFalse(rendered.contains("CANARY"), "the peer's text must not reach the error: \(rendered)")
+        }
+    }
+
+    /// OpenSSH PROTOCOL, "strict KEX", clause (a): with the mode negotiated the
+    /// KEXINIT must be the connection's first packet. Anything ahead of it has already
+    /// been counted by the parser, which is the sequence-number shift the mitigation
+    /// exists to remove.
+    func testStrictKeyExchangeRequiresKexInitToBeTheFirstPacket() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            )
+        )
+
+        var clientBuffer = allocator.buffer(capacity: 1024)
+        var serverBuffer = allocator.buffer(capacity: 1024)
+        for message in client.start()! {
+            try client.processOutboundMessage(message, buffer: &clientBuffer, allocator: allocator, loop: loop)
+        }
+        for message in server.start()! {
+            try server.processOutboundMessage(message, buffer: &serverBuffer, allocator: allocator, loop: loop)
+        }
+        client.bufferInboundData(&serverBuffer)
+        server.bufferInboundData(&clientBuffer)
+
+        var clientKexInitBytes = allocator.buffer(capacity: 1024)
+        guard case .some(.emitMessage(let clientKexInit)) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("client did not emit its KEXINIT") }
+        for message in clientKexInit {
+            try client.processOutboundMessage(message, buffer: &clientKexInitBytes, allocator: allocator, loop: loop)
+        }
+        server.bufferInboundData(&clientKexInitBytes)
+        guard case .some(.emitMessage(let serverKexInit)) = try server.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("server did not emit its KEXINIT") }
+
+        // The server slips an SSH_MSG_IGNORE in ahead of its KEXINIT. The mode is not
+        // on yet when that packet is parsed, so it is tolerated — but it consumed
+        // sequence number zero, and the KEXINIT behind it must therefore be refused.
+        var serverBytes = allocator.buffer(capacity: 1024)
+        try server.processOutboundMessage(
+            .ignore(.init(data: allocator.buffer(capacity: 0))),
+            buffer: &serverBytes,
+            allocator: allocator,
+            loop: loop
+        )
+        for message in serverKexInit {
+            try server.processOutboundMessage(message, buffer: &serverBytes, allocator: allocator, loop: loop)
+        }
+        client.bufferInboundData(&serverBytes)
+
+        guard case .some(.noMessage) = try client.processInboundMessage(allocator: allocator, loop: loop) else {
+            return XCTFail("the SSH_MSG_IGNORE ahead of the KEXINIT should be tolerated: the mode is not on yet")
+        }
+        XCTAssertThrowsError(try client.processInboundMessage(allocator: allocator, loop: loop)) { error in
+            XCTAssertEqual((error as? NIOSSHError)?.type, .protocolViolation)
+            XCTAssertTrue(
+                "\(error)".contains("KEXINIT was not the first packet"),
+                "unexpected violation: \(error)"
+            )
+        }
+    }
+
+    /// The proof that the two strict-KEX sequence-number resets stay in step.
+    ///
+    /// The bundled schemes cannot show it: AES-GCM keeps its own nonce and ignores the
+    /// `sequenceNumber` parameter, so a client whose receive counter never reset would
+    /// still decrypt everything. `SequenceNumberBoundTransportProtection` binds the
+    /// number into the MAC, the way every encrypt-then-MAC scheme does (which is what
+    /// makes a desync fatal against a modern CTR+ETM server), so a whole connection
+    /// driven over it — key exchange, NEWKEYS on both sides, user auth, then traffic in
+    /// both directions — only completes if all four resets agree.
+    func testSequenceNumbersStayInStepUnderStrictKeyExchange() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        let schemes: [NIOSSHTransportProtection.Type] = [SequenceNumberBoundTransportProtection.self]
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            ),
+            protectionSchemes: schemes
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            ),
+            protectionSchemes: schemes
+        )
+        try assertSuccessfulConnection(client: &client, server: &server, allocator: allocator, loop: loop)
+        try self.assertDataFlowsBothWays(client: &client, server: &server, allocator: allocator, loop: loop)
+    }
+
+    /// …and at *every* NEWKEYS, not only the first. OpenSSH resets the sequence
+    /// numbers on each rekey under strict key exchange, so
+    /// `SentKexInitWhenActiveState` / `ReceivedKexInitWhenActiveState` inherit
+    /// `previous.parser.strictKeyExchange`; nothing else in this suite rekeys with
+    /// the mode engaged, and over a scheme that binds the sequence number into the
+    /// MAC, dropping that inheritance is a MAC failure on the first packet after
+    /// the new keys.
+    func testSequenceNumbersStayInStepAcrossARekeyUnderStrictKeyExchange() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        let schemes: [NIOSSHTransportProtection.Type] = [SequenceNumberBoundTransportProtection.self]
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            ),
+            protectionSchemes: schemes
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            ),
+            protectionSchemes: schemes
+        )
+        try assertSuccessfulConnection(client: &client, server: &server, allocator: allocator, loop: loop)
+        try self.assertDataFlowsBothWays(client: &client, server: &server, allocator: allocator, loop: loop)
+
+        // The client asks to rekey; pump both sides to quiescence.
+
+        var buffer = allocator.buffer(capacity: 1024)
+        XCTAssertNoThrow(try client.beginRekeying(buffer: &buffer, allocator: allocator, loop: loop))
+        server.bufferInboundData(&buffer)
+        guard case .some(.emitMessage(let response)) =
+            try server.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("the server did not answer the rekey") }
+        try self.run(
+            clientMessage: nil,
+            client: &client,
+            serverMessage: response,
+            server: &server,
+            allocator: allocator,
+            loop: loop
+        )
+
+        // Both sides are on the second set of keys now, and both reset at the second
+        // NEWKEYS: the first packet each sends afterwards is sequence number 0.
+        // Two peers that both *fail* to reset stay in step with each other, so the
+        // numbers themselves are the only observable — nothing decrypts wrongly.
+        SequenceNumberBoundTransportProtection.encryptedSequenceNumbers.withLockedValue { $0 = [] }
+        try self.assertDataFlowsBothWays(client: &client, server: &server, allocator: allocator, loop: loop)
+        let afterRekey = SequenceNumberBoundTransportProtection.encryptedSequenceNumbers.withLockedValue { $0 }
+        XCTAssertEqual(
+            Array(afterRekey.prefix(2)),
+            [0, 0],
+            "the sequence numbers did not reset at the rekey's NEWKEYS: \(afterRekey.prefix(4))"
+        )
+    }
+
+    /// The path every peer without the mitigation takes — Dropbear, libssh, an
+    /// appliance. Both roles propose the marker, so nothing else in this suite reaches
+    /// it: no sequence-number reset at NEWKEYS, and the connection has to work anyway.
+    func testConnectionWithAPeerThatDoesNotImplementStrictKeyExchange() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        let schemes: [NIOSSHTransportProtection.Type] = [SequenceNumberBoundTransportProtection.self]
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            ),
+            protectionSchemes: schemes
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            ),
+            protectionSchemes: schemes,
+            implementsStrictKeyExchange: false
+        )
+        try assertSuccessfulConnection(client: &client, server: &server, allocator: allocator, loop: loop)
+        try self.assertDataFlowsBothWays(client: &client, server: &server, allocator: allocator, loop: loop)
+    }
+
+    /// …and the same peer's `SSH_MSG_IGNORE` during key exchange must still be
+    /// tolerated: the message discipline is only in force when the mode is negotiated,
+    /// and RFC 4253 allows the message otherwise.
+    func testAMarkerlessPeerMayStillSendIgnoreDuringKeyExchange() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            ),
+            implementsStrictKeyExchange: false
+        )
+        try self.exchangeVersionsAndKexInits(
+            client: &client,
+            server: &server,
+            allocator: allocator,
+            loop: loop
+        )
+
+        var injected = allocator.buffer(capacity: 32)
+        try server.processOutboundMessage(
+            .ignore(.init(data: allocator.buffer(capacity: 0))),
+            buffer: &injected,
+            allocator: allocator,
+            loop: loop
+        )
+        client.bufferInboundData(&injected)
+        guard case .some(.noMessage) = try client.processInboundMessage(allocator: allocator, loop: loop) else {
+            return XCTFail("a peer without strict key exchange may send SSH_MSG_IGNORE during key exchange")
+        }
+    }
+
+    /// Version exchange plus both KEXINITs, leaving each side mid-key-exchange.
+    private func exchangeVersionsAndKexInits(
+        client: inout SSHConnectionStateMachine,
+        server: inout SSHConnectionStateMachine,
+        allocator: ByteBufferAllocator,
+        loop: EmbeddedEventLoop
+    ) throws {
+        var clientBuffer = allocator.buffer(capacity: 1024)
+        var serverBuffer = allocator.buffer(capacity: 1024)
+        for message in client.start()! {
+            try client.processOutboundMessage(message, buffer: &clientBuffer, allocator: allocator, loop: loop)
+        }
+        for message in server.start()! {
+            try server.processOutboundMessage(message, buffer: &serverBuffer, allocator: allocator, loop: loop)
+        }
+        client.bufferInboundData(&serverBuffer)
+        server.bufferInboundData(&clientBuffer)
+
+        var clientKexInitBytes = allocator.buffer(capacity: 1024)
+        guard case .some(.emitMessage(let clientKexInit)) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("client did not emit its KEXINIT") }
+        for message in clientKexInit {
+            try client.processOutboundMessage(message, buffer: &clientKexInitBytes, allocator: allocator, loop: loop)
+        }
+
+        var serverKexInitBytes = allocator.buffer(capacity: 1024)
+        guard case .some(.emitMessage(let serverKexInit)) = try server.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("server did not emit its KEXINIT") }
+        for message in serverKexInit {
+            try server.processOutboundMessage(message, buffer: &serverKexInitBytes, allocator: allocator, loop: loop)
+        }
+
+        client.bufferInboundData(&serverKexInitBytes)
+        server.bufferInboundData(&clientKexInitBytes)
+        XCTAssertNotNil(try client.processInboundMessage(allocator: allocator, loop: loop))
+        XCTAssertNotNil(try server.processInboundMessage(allocator: allocator, loop: loop))
+    }
+
+    /// One encrypted `SSH_MSG_CHANNEL_DATA` each way over an established connection.
+    private func assertDataFlowsBothWays(
+        client: inout SSHConnectionStateMachine,
+        server: inout SSHConnectionStateMachine,
+        allocator: ByteBufferAllocator,
+        loop: EmbeddedEventLoop
+    ) throws {
+        func send(
+            _ message: SSHMessage,
+            from sender: inout SSHConnectionStateMachine,
+            to receiver: inout SSHConnectionStateMachine
+        ) throws {
+            var buffer = allocator.buffer(capacity: 1024)
+            try sender.processOutboundMessage(message, buffer: &buffer, allocator: allocator, loop: loop)
+            receiver.bufferInboundData(&buffer)
+            guard case .some(.forwardToMultiplexer(let received)) =
+                try receiver.processInboundMessage(allocator: allocator, loop: loop)
+            else { return XCTFail("message did not arrive") }
+            XCTAssertEqual(received, message)
+        }
+
+        // Several in each direction: a desync that only bites after the first packet
+        // (a counter that resumes from the wrong base) has to show up too.
+        for i in 0..<4 {
+            let toServer = SSHMessage.channelData(
+                .init(recipientChannel: 1, data: ByteBuffer(repeating: UInt8(i), count: 5))
+            )
+            try send(toServer, from: &client, to: &server)
+            let toClient = SSHMessage.channelData(
+                .init(recipientChannel: 2, data: ByteBuffer(repeating: UInt8(i + 64), count: 7))
+            )
+            try send(toClient, from: &server, to: &client)
+        }
+    }
+
     func testUnimplementedGivesARichError() throws {
         let allocator = ByteBufferAllocator()
         let loop = EmbeddedEventLoop()

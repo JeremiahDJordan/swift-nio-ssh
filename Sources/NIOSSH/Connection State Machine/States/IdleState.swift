@@ -23,10 +23,19 @@ extension SSHConnectionStateMachine {
 
         internal var protectionSchemes: [NIOSSHTransportProtection.Type]
 
-        init(role: SSHConnectionRole, protectionSchemes: [NIOSSHTransportProtection.Type]) {
+        /// Whether this role implements strict key exchange at all. Always true in
+        /// production; see `SSHKeyExchangeStateMachine`.
+        internal let implementsStrictKeyExchange: Bool
+
+        init(
+            role: SSHConnectionRole,
+            protectionSchemes: [NIOSSHTransportProtection.Type],
+            implementsStrictKeyExchange: Bool = true
+        ) {
             self.role = role
             self.serializer = SSHPacketSerializer()
             self.protectionSchemes = protectionSchemes
+            self.implementsStrictKeyExchange = implementsStrictKeyExchange
         }
     }
 }
