@@ -182,6 +182,9 @@ struct SSHConnectionStateMachine {
                         return .noMessage
                     case .unrecognized(let unrecognized):
                         // Strict key exchange: an unknown type is as injectable as SSH_MSG_IGNORE.
+                        // Before the peer's KEXINIT the mode is not known yet, so one is answered;
+                        // the KEXINIT that follows is then not packet zero and is refused, which
+                        // ends the connection (the answer carries nothing into the next keys).
                         guard state.toleratesNonKeyExchangeMessages else {
                             throw SSHConnectionStateMachine.strictKeyExchangeViolation(message)
                         }

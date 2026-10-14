@@ -1291,6 +1291,308 @@ final class SSHConnectionStateMachineTests: XCTestCase {
         XCTAssertGreaterThan(wire.readableBytes, 0)
     }
 
+    /// The two NEWKEYS half-states: the server once it has sent its NEWKEYS (`sentNewKeys`), the
+    /// client once it has received the server's but not yet sent its own (`receivedNewKeys`, here
+    /// because its host key check is still pending). Under strict key exchange an unknown message
+    /// there is refused like SSH_MSG_IGNORE; without it, it is answered.
+    func testUnrecognizedMessagesAroundNewKeys() throws {
+        for strict in [true, false] {
+            try self.assertUnrecognizedMessagesAroundNewKeys(strict: strict)
+        }
+    }
+
+    private func assertUnrecognizedMessagesAroundNewKeys(strict: Bool) throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            ),
+            implementsStrictKeyExchange: strict
+        )
+        var toServer = allocator.buffer(capacity: 1024)
+        var toClient = allocator.buffer(capacity: 1024)
+        func send(
+            _ messages: SSHMultiMessage,
+            from sender: inout SSHConnectionStateMachine,
+            into buffer: inout ByteBuffer
+        )
+            throws
+        {
+            for message in messages {
+                try sender.processOutboundMessage(message, buffer: &buffer, allocator: allocator, loop: loop)
+            }
+        }
+        func assertRefusedOrAnswered(
+            sender: inout SSHConnectionStateMachine,
+            receiver: inout SSHConnectionStateMachine,
+            line: UInt = #line
+        ) throws {
+            var injected = allocator.buffer(capacity: 64)
+            try sender.processOutboundMessage(
+                .unrecognized(.init(type: 200, sequenceNumber: 0)),
+                buffer: &injected,
+                allocator: allocator,
+                loop: loop
+            )
+            receiver.bufferInboundData(&injected)
+            if strict {
+                XCTAssertThrowsError(try receiver.processInboundMessage(allocator: allocator, loop: loop), line: line) {
+                    XCTAssertTrue("\($0)".contains("strict key exchange"), "\($0)", line: line)
+                }
+            } else {
+                guard
+                    case .some(.emitMessage(let reply)) = try receiver.processInboundMessage(
+                        allocator: allocator,
+                        loop: loop
+                    ), case .unimplemented = reply.first
+                else {
+                    return XCTFail("expected SSH_MSG_UNIMPLEMENTED", line: line)
+                }
+            }
+        }
+
+        // Versions, then each side's KEXINIT.
+        try send(client.start()!, from: &client, into: &toServer)
+        try send(server.start()!, from: &server, into: &toClient)
+        server.bufferInboundData(&toServer)
+        client.bufferInboundData(&toClient)
+        guard
+            case .some(.emitMessage(let clientKexInit)) = try client.processInboundMessage(
+                allocator: allocator,
+                loop: loop
+            ),
+            case .some(.emitMessage(let serverKexInit)) = try server.processInboundMessage(
+                allocator: allocator,
+                loop: loop
+            )
+        else { return XCTFail("no KEXINIT") }
+        try send(clientKexInit, from: &client, into: &toServer)
+        try send(serverKexInit, from: &server, into: &toClient)
+
+        // The KEXINITs cross; the client answers with ECDH_INIT, the server with ECDH_REPLY + NEWKEYS.
+        server.bufferInboundData(&toServer)
+        client.bufferInboundData(&toClient)
+        XCTAssertNotNil(try server.processInboundMessage(allocator: allocator, loop: loop))
+        guard
+            case .some(.emitMessage(let ecdhInit)) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("no ECDH_INIT") }
+        try send(ecdhInit, from: &client, into: &toServer)
+        server.bufferInboundData(&toServer)
+        guard
+            case .some(.emitMessage(let replyAndNewKeys)) = try server.processInboundMessage(
+                allocator: allocator,
+                loop: loop
+            )
+        else { return XCTFail("no ECDH_REPLY") }
+        try send(replyAndNewKeys, from: &server, into: &toClient)
+
+        // The server is in `sentNewKeys`. Copies are safe here: neither direction the injection
+        // touches is encrypted yet, so no transport protection state is shared.
+        var clientCopy = client
+        var serverCopy = server
+        try assertRefusedOrAnswered(sender: &clientCopy, receiver: &serverCopy)
+
+        // The client reads the reply (its host key check answers later) and the server's NEWKEYS:
+        // it is in `receivedNewKeys`.
+        client.bufferInboundData(&toClient)
+        guard case .some(.possibleFutureMessage) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("expected the host key check") }
+        guard case .some(.noMessage) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("expected the server's NEWKEYS") }
+        try assertRefusedOrAnswered(sender: &server, receiver: &client)
+    }
+
+    /// The rekey half-states a pump cannot reach, because each peer leaves them while processing
+    /// the message that put it there: `receivedKexInitWhenActive` (the peer's KEXINIT read, ours
+    /// not yet sent), `sentKexInitWhenActive` (ours sent, the peer's not yet read) and
+    /// `rekeyingReceivedNewKeysState` (the peer's NEWKEYS read, ours not yet sent).
+    func testUnrecognizedMessagesAreAnsweredInTheRekeyHalfStates() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            )
+        )
+        try assertSuccessfulConnection(client: &client, server: &server, allocator: allocator, loop: loop)
+
+        func send(
+            _ messages: SSHMultiMessage,
+            from sender: inout SSHConnectionStateMachine,
+            into buffer: inout ByteBuffer
+        )
+            throws
+        {
+            for message in messages {
+                try sender.processOutboundMessage(message, buffer: &buffer, allocator: allocator, loop: loop)
+            }
+        }
+        func assertAnswered(
+            from sender: inout SSHConnectionStateMachine,
+            to receiver: inout SSHConnectionStateMachine,
+            line: UInt = #line
+        ) throws {
+            var injected = allocator.buffer(capacity: 64)
+            try sender.processOutboundMessage(
+                .unrecognized(.init(type: 200, sequenceNumber: 0)),
+                buffer: &injected,
+                allocator: allocator,
+                loop: loop
+            )
+            receiver.bufferInboundData(&injected)
+            guard
+                case .some(.emitMessage(let reply)) = try receiver.processInboundMessage(
+                    allocator: allocator,
+                    loop: loop
+                ),
+                case .unimplemented = reply.first
+            else {
+                return XCTFail("expected SSH_MSG_UNIMPLEMENTED", line: line)
+            }
+            // The answer is not sent: it would overtake output the receiver has already queued.
+            // (Answers on the wire are covered by the pump tests.)
+        }
+
+        // The client starts a rekey: it is in `sentKexInitWhenActive`.
+        var toServer = allocator.buffer(capacity: 1024)
+        var toClient = allocator.buffer(capacity: 1024)
+        try client.beginRekeying(buffer: &toServer, allocator: allocator, loop: loop)
+        try assertAnswered(from: &server, to: &client)
+
+        // The server reads the client's KEXINIT and holds its own: `receivedKexInitWhenActive`.
+        server.bufferInboundData(&toServer)
+        guard
+            case .some(.emitMessage(let serverKexInit)) = try server.processInboundMessage(
+                allocator: allocator,
+                loop: loop
+            )
+        else { return XCTFail("no KEXINIT") }
+        try assertAnswered(from: &client, to: &server)
+        try send(serverKexInit, from: &server, into: &toClient)
+
+        // The exchange proceeds until the client has the server's NEWKEYS but holds its own
+        // (its host key check is pending): `rekeyingReceivedNewKeysState`.
+        client.bufferInboundData(&toClient)
+        guard
+            case .some(.emitMessage(let ecdhInit)) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("no ECDH_INIT") }
+        try send(ecdhInit, from: &client, into: &toServer)
+        server.bufferInboundData(&toServer)
+        guard
+            case .some(.emitMessage(let replyAndNewKeys)) = try server.processInboundMessage(
+                allocator: allocator,
+                loop: loop
+            )
+        else { return XCTFail("no ECDH_REPLY") }
+        try send(replyAndNewKeys, from: &server, into: &toClient)
+        client.bufferInboundData(&toClient)
+        guard
+            case .some(.possibleFutureMessage(let clientNewKeys)) = try client.processInboundMessage(
+                allocator: allocator,
+                loop: loop
+            )
+        else { return XCTFail("expected the host key check") }
+        guard case .some(.noMessage) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else { return XCTFail("expected the server's NEWKEYS") }
+        try assertAnswered(from: &server, to: &client)
+
+        // And the rekey still completes.
+        loop.run()
+        try send(XCTUnwrap(try clientNewKeys.wait()), from: &client, into: &toServer)
+        server.bufferInboundData(&toServer)
+        XCTAssertNotNil(try server.processInboundMessage(allocator: allocator, loop: loop))
+        XCTAssertTrue(client.isActive)
+        XCTAssertTrue(server.isActive)
+    }
+
+    /// Puts an unknown message in front of every delivery of a non-strict handshake, so each
+    /// intermediate state of both peers sees one, and checks that every one is answered (and
+    /// that every answer, bounced back, reaches the sender as SSH_MSG_UNIMPLEMENTED).
+    func testUnrecognizedMessagesAreAnsweredThroughoutANonStrictHandshake() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            ),
+            implementsStrictKeyExchange: false
+        )
+        var pump = UnrecognizedMessagePump(allocator: allocator, loop: loop)
+        try pump.startConnection(client: &client, server: &server)
+        try pump.run(client: &client, server: &server, injecting: true)
+        XCTAssertGreaterThan(pump.injected, 6)
+        XCTAssertEqual(pump.injected, pump.replies)
+        XCTAssertEqual(pump.replies, pump.bounced)
+        XCTAssertTrue(client.isActive)
+        XCTAssertTrue(server.isActive)
+    }
+
+    /// The same through a rekey started by each side under strict key exchange (which only
+    /// governs the initial exchange), covering every rekey state.
+    func testUnrecognizedMessagesAreAnsweredThroughoutARekey() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            )
+        )
+        var pump = UnrecognizedMessagePump(allocator: allocator, loop: loop)
+        try pump.startConnection(client: &client, server: &server)
+        try pump.run(client: &client, server: &server, injecting: false)
+        XCTAssertTrue(client.isActive)
+
+        for clientStarts in [true, false] {
+            pump.injected = 0
+            pump.replies = 0
+            pump.bounced = 0
+            if clientStarts {
+                try client.beginRekeying(buffer: &pump.toServer, allocator: allocator, loop: loop)
+            } else {
+                try server.beginRekeying(buffer: &pump.toClient, allocator: allocator, loop: loop)
+            }
+            try pump.run(client: &client, server: &server, injecting: true)
+            XCTAssertGreaterThan(pump.injected, 4, "client starts: \(clientStarts)")
+            XCTAssertEqual(pump.injected, pump.replies, "client starts: \(clientStarts)")
+            XCTAssertEqual(pump.replies, pump.bounced, "client starts: \(clientStarts)")
+            XCTAssertTrue(client.isActive)
+            XCTAssertTrue(server.isActive)
+        }
+    }
+
     func testUnimplementedGivesARichError() throws {
         let allocator = ByteBufferAllocator()
         let loop = EmbeddedEventLoop()
@@ -1602,6 +1904,179 @@ extension Optional where Wrapped == SSHMultiMessage {
             self = .some(SSHMultiMessage(original.first!, message.first!))
         } else {
             self = .some(message)
+        }
+    }
+}
+
+/// Drives two connection state machines to quiescence, optionally putting an unrecognized
+/// message in front of each delivery (the first 30), and counts the injections, the SSH_MSG_UNIMPLEMENTED
+/// answers, and the answers that came back to their sender as `remotePeerDoesNotSupportMessage`.
+private struct UnrecognizedMessagePump {
+    let allocator: ByteBufferAllocator
+    let loop: EmbeddedEventLoop
+    var toServer: ByteBuffer
+    var toClient: ByteBuffer
+    var injected = 0
+    var replies = 0
+    var bounced = 0
+
+    init(allocator: ByteBufferAllocator, loop: EmbeddedEventLoop) {
+        self.allocator = allocator
+        self.loop = loop
+        self.toServer = allocator.buffer(capacity: 1024)
+        self.toClient = allocator.buffer(capacity: 1024)
+    }
+
+    /// Version exchange and both KEXINITs (nothing can be injected before the version).
+    mutating func startConnection(
+        client: inout SSHConnectionStateMachine,
+        server: inout SSHConnectionStateMachine
+    )
+        throws
+    {
+        var versionToServer = self.allocator.buffer(capacity: 64)
+        var versionToClient = self.allocator.buffer(capacity: 64)
+        for message in client.start()! {
+            try client.processOutboundMessage(
+                message,
+                buffer: &versionToServer,
+                allocator: self.allocator,
+                loop: self.loop
+            )
+        }
+        for message in server.start()! {
+            try server.processOutboundMessage(
+                message,
+                buffer: &versionToClient,
+                allocator: self.allocator,
+                loop: self.loop
+            )
+        }
+        client.bufferInboundData(&versionToClient)
+        server.bufferInboundData(&versionToServer)
+        guard
+            case .some(.emitMessage(let clientKexInit)) = try client.processInboundMessage(
+                allocator: self.allocator,
+                loop: self.loop
+            ),
+            case .some(.emitMessage(let serverKexInit)) = try server.processInboundMessage(
+                allocator: self.allocator,
+                loop: self.loop
+            )
+        else {
+            return XCTFail("no KEXINIT")
+        }
+        for message in clientKexInit {
+            try client.processOutboundMessage(
+                message,
+                buffer: &self.toServer,
+                allocator: self.allocator,
+                loop: self.loop
+            )
+        }
+        for message in serverKexInit {
+            try server.processOutboundMessage(
+                message,
+                buffer: &self.toClient,
+                allocator: self.allocator,
+                loop: self.loop
+            )
+        }
+    }
+
+    mutating func run(
+        client: inout SSHConnectionStateMachine,
+        server: inout SSHConnectionStateMachine,
+        injecting: Bool
+    ) throws {
+        // Every answer is itself a delivery, so injections are budgeted: enough to precede every
+        // message of a handshake or rekey (about a dozen deliveries), then the peers go quiet.
+        var budget = injecting ? 30 : 0
+        let unknown = SSHMessage.unrecognized(.init(type: 200, sequenceNumber: 0))
+        var rounds = 0
+        while self.toServer.readableBytes > 0 || self.toClient.readableBytes > 0 {
+            rounds += 1
+            guard rounds < 100 else { return XCTFail("the peers never went quiet") }
+            if self.toServer.readableBytes > 0 {
+                if budget > 0 {
+                    budget -= 1
+                    self.injected += 1
+                    try client.processOutboundMessage(
+                        unknown,
+                        buffer: &self.toServer,
+                        allocator: self.allocator,
+                        loop: self.loop
+                    )
+                }
+                var inbound = self.toServer
+                self.toServer.clear()
+                var answers = self.allocator.buffer(capacity: 256)
+                try self.deliver(&inbound, to: &server, replies: &answers)
+                self.toClient.writeBuffer(&answers)
+            }
+            if self.toClient.readableBytes > 0 {
+                if budget > 0 {
+                    budget -= 1
+                    self.injected += 1
+                    try server.processOutboundMessage(
+                        unknown,
+                        buffer: &self.toClient,
+                        allocator: self.allocator,
+                        loop: self.loop
+                    )
+                }
+                var inbound = self.toClient
+                self.toClient.clear()
+                var answers = self.allocator.buffer(capacity: 256)
+                try self.deliver(&inbound, to: &client, replies: &answers)
+                self.toServer.writeBuffer(&answers)
+            }
+        }
+    }
+
+    private mutating func deliver(
+        _ inbound: inout ByteBuffer,
+        to receiver: inout SSHConnectionStateMachine,
+        replies outbound: inout ByteBuffer
+    ) throws {
+        receiver.bufferInboundData(&inbound)
+        while true {
+            let result: SSHConnectionStateMachine.StateMachineInboundProcessResult?
+            do {
+                result = try receiver.processInboundMessage(allocator: self.allocator, loop: self.loop)
+            } catch let error as NIOSSHError where error.type == .remotePeerDoesNotSupportMessage {
+                // One of our answers came back to the peer that sent the unknown message.
+                self.bounced += 1
+                continue
+            }
+            var emitted: [SSHMultiMessage] = []
+            switch result {
+            case .none:
+                return
+            case .some(.emitMessage(let message)):
+                emitted.append(message)
+            case .some(.possibleFutureMessage(let future)):
+                self.loop.run()
+                if let message = try future.wait() {
+                    emitted.append(message)
+                }
+            case .some(.noMessage), .some(.forwardToMultiplexer), .some(.globalRequest),
+                .some(.globalRequestResponse), .some(.disconnect), .some(.event):
+                break
+            }
+            for multiMessage in emitted {
+                for message in multiMessage {
+                    if case .unimplemented = message {
+                        self.replies += 1
+                    }
+                    try receiver.processOutboundMessage(
+                        message,
+                        buffer: &outbound,
+                        allocator: self.allocator,
+                        loop: self.loop
+                    )
+                }
+            }
         }
     }
 }
