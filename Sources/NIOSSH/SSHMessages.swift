@@ -242,11 +242,26 @@ extension SSHMessage {
 
     /// SSH_MSG_USERAUTH_INFO_RESPONSE, sent by the client during RFC 4256 `keyboard-interactive`
     /// authentication.
-    struct UserAuthInfoResponseMessage: Equatable {
+    struct UserAuthInfoResponseMessage: Equatable, CustomStringConvertible {
         // SSH_MSG_USERAUTH_INFO_RESPONSE
         static let id: UInt8 = 61
 
         var responses: [String]
+
+        /// The challenge this answers, numbered by the client's `UserAuthenticationStateMachine`
+        /// so that an answer arriving after its challenge was superseded is dropped, never sent as
+        /// the answer to a later one. Not on the wire, and not part of equality.
+        var challengeID: UInt64? = nil
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.responses == rhs.responses
+        }
+
+        /// The responses are passwords and one-time codes: never in a description, which can end
+        /// up in an error message or a log.
+        var description: String {
+            "UserAuthInfoResponseMessage(\(self.responses.count) responses)"
+        }
     }
 
     struct GlobalRequestMessage: Equatable {

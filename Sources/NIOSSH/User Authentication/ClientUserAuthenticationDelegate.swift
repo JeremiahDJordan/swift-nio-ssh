@@ -48,7 +48,10 @@ public protocol NIOSSHClientUserAuthenticationDelegate {
     /// delegate must succeed the promise with an empty array.
     ///
     /// If the delegate fails `responsePromise`, or provides a number of responses that does not
-    /// match the number of prompts, the authentication attempt fails.
+    /// match the number of prompts, the error is fired down the channel pipeline
+    /// (`errorCaught`). Nothing is sent to the server, so the attempt does not conclude: the
+    /// application must close the connection (RFC 4256 has no way to abandon a challenge other
+    /// than a new authentication request, which NIOSSH does not send on its own).
     ///
     /// - Important: Prompts whose ``NIOSSHKeyboardInteractivePrompt/echo`` is `false` are sensitive.
     ///   Implementations must not log the prompts' responses.

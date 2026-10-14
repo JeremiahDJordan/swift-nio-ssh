@@ -1626,6 +1626,67 @@ final class SSHConnectionStateMachineTests: XCTestCase {
         try self.assertDataFlowsBothWays(client: &client, server: &server, allocator: allocator, loop: loop)
     }
 
+    /// Identifier 60 through the whole connection: during a keyboard-interactive attempt the
+    /// client decodes it as SSH_MSG_USERAUTH_INFO_REQUEST (the parser is told before every read)
+    /// and answers with SSH_MSG_USERAUTH_INFO_RESPONSE.
+    func testKeyboardInteractiveChallengeIsDecodedAndAnsweredOnTheConnection() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: KeyboardInteractiveDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            )
+        )
+        // Run until the client sends its keyboard-interactive request, which the server never sees.
+        var pump = UnrecognizedMessagePump(allocator: allocator, loop: loop)
+        pump.hold = { message in
+            if case .userAuthRequest(let request) = message, case .keyboardInteractive = request.method {
+                return true
+            }
+            return false
+        }
+        try pump.startConnection(client: &client, server: &server)
+        try pump.run(client: &client, server: &server, injecting: false)
+        XCTAssertGreaterThan(pump.held.readableBytes, 0, "the client did not offer keyboard-interactive")
+
+        // The server challenges.
+        var challenge = allocator.buffer(capacity: 128)
+        try server.processOutboundMessage(
+            .userAuthInfoRequest(
+                .init(name: "", instruction: "", languageTag: "", prompts: [.init(prompt: "Code: ", echo: false)])
+            ),
+            buffer: &challenge,
+            allocator: allocator,
+            loop: loop
+        )
+        client.bufferInboundData(&challenge)
+        guard
+            case .some(.possibleFutureMessage(let answer)) = try client.processInboundMessage(
+                allocator: allocator,
+                loop: loop
+            )
+        else {
+            return XCTFail("the challenge was not decoded as SSH_MSG_USERAUTH_INFO_REQUEST")
+        }
+        loop.run()
+        let reply = try XCTUnwrap(try answer.wait())
+        XCTAssertEqual(Array(reply), [.userAuthInfoResponse(.init(responses: ["response-to-Code: "]))])
+
+        var wire = allocator.buffer(capacity: 128)
+        for message in reply {
+            try client.processOutboundMessage(message, buffer: &wire, allocator: allocator, loop: loop)
+        }
+        XCTAssertGreaterThan(wire.readableBytes, 0, "the answer was not sent")
+    }
+
     func testUnimplementedGivesARichError() throws {
         let allocator = ByteBufferAllocator()
         let loop = EmbeddedEventLoop()
@@ -1952,12 +2013,16 @@ private struct UnrecognizedMessagePump {
     var injected = 0
     var replies = 0
     var bounced = 0
+    /// Messages for which this returns `true` are serialized into `held` instead of being sent.
+    var hold: (SSHMessage) -> Bool = { _ in false }
+    var held: ByteBuffer
 
     init(allocator: ByteBufferAllocator, loop: EmbeddedEventLoop) {
         self.allocator = allocator
         self.loop = loop
         self.toServer = allocator.buffer(capacity: 1024)
         self.toClient = allocator.buffer(capacity: 1024)
+        self.held = allocator.buffer(capacity: 1024)
     }
 
     /// Version exchange and both KEXINITs (nothing can be injected before the version).
@@ -2101,6 +2166,15 @@ private struct UnrecognizedMessagePump {
                 for message in multiMessage {
                     if case .unimplemented = message {
                         self.replies += 1
+                    }
+                    if self.hold(message) {
+                        try receiver.processOutboundMessage(
+                            message,
+                            buffer: &self.held,
+                            allocator: self.allocator,
+                            loop: self.loop
+                        )
+                        continue
                     }
                     try receiver.processOutboundMessage(
                         message,

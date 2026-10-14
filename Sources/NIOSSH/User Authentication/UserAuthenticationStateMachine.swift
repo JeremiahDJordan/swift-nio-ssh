@@ -31,9 +31,12 @@ struct UserAuthenticationStateMachine {
     /// ``expectingKeyboardInteractiveInfoRequest``.
     private var lastSentMethodWasKeyboardInteractive: Bool = false
 
-    /// Whether a keyboard-interactive challenge (SSH_MSG_USERAUTH_INFO_REQUEST) is waiting for the
-    /// delegate's answer. At most one is: RFC 4256 §3.2 has the server wait for the response.
-    private var infoRequestOutstanding: Bool = false
+    /// The keyboard-interactive challenge (SSH_MSG_USERAUTH_INFO_REQUEST) waiting for the
+    /// delegate's answer, if any. At most one is: RFC 4256 §3.2 has the server wait for the
+    /// response. Challenges are numbered so that a late answer to a superseded challenge (the
+    /// attempt failed, and a new attempt challenged again) cannot pass for the answer to the new one.
+    private var outstandingChallenge: UInt64? = nil
+    private var lastChallengeID: UInt64 = 0
 
     init(role: SSHConnectionRole, loop: EventLoop, sessionID: ByteBuffer) {
         self.state = .idle
@@ -239,7 +242,7 @@ extension UserAuthenticationStateMachine {
         case (.client, .awaitingResponses):
             // Great, we got a response, and it's a success! Disregard all future responses
             // (including the answer to a keyboard-interactive challenge still with the delegate).
-            self.infoRequestOutstanding = false
+            self.outstandingChallenge = nil
             self.state = .authenticationSucceeded
         case (.client, .authenticationSucceeded):
             // We should ignore all further auth messages in this state.
@@ -272,7 +275,7 @@ extension UserAuthenticationStateMachine {
         case (.client(let delegate), .awaitingResponses(let attempts, let responseCount)):
             // Ok, the server didn't like that much. Let's try another one. An answer to a
             // keyboard-interactive challenge still with the delegate is now stale, and dropped.
-            self.infoRequestOutstanding = false
+            self.outstandingChallenge = nil
             self.state = .awaitingNextRequest(attempts: attempts)
             precondition(responseCount == 1, "We don't support parallel authentication attempts yet!")
             return self.requestNextAuthRequest(methods: .init(message), delegate: delegate)
@@ -317,14 +320,19 @@ extension UserAuthenticationStateMachine {
                 )
             }
             // RFC 4256 §3.2: the server waits for the response before it sends another challenge.
-            guard !self.infoRequestOutstanding else {
+            guard self.outstandingChallenge == nil else {
                 throw NIOSSHError.protocolViolation(
                     protocolName: Self.protocolName,
                     violation: "keyboard-interactive info request before the previous one was answered"
                 )
             }
-            self.infoRequestOutstanding = true
-            return self.requestKeyboardInteractiveResponse(request: message, delegate: delegate)
+            self.lastChallengeID &+= 1
+            self.outstandingChallenge = self.lastChallengeID
+            return self.requestKeyboardInteractiveResponse(
+                request: message,
+                challengeID: self.lastChallengeID,
+                delegate: delegate
+            )
         case (.client, .authenticationSucceeded):
             // We should ignore all further auth messages in this state.
             return nil
@@ -415,7 +423,7 @@ extension UserAuthenticationStateMachine {
             } else {
                 self.lastSentMethodWasKeyboardInteractive = false
             }
-            self.infoRequestOutstanding = false
+            self.outstandingChallenge = nil
             self.state = .awaitingResponses(attempts: attempts, pending: 1)
         case (.client, .idle),
             (.client, .awaitingServiceAcceptance):
@@ -440,12 +448,13 @@ extension UserAuthenticationStateMachine {
     /// - returns: whether to send it. The delegate answers asynchronously (a person is typing), and
     ///     the server may end the attempt meanwhile, with a failure or a success; such an answer is
     ///     stale and must be dropped, never sent into the next attempt or after authentication.
-    mutating func sendUserAuthInfoResponse(_: SSHMessage.UserAuthInfoResponseMessage) -> Bool {
+    mutating func sendUserAuthInfoResponse(_ message: SSHMessage.UserAuthInfoResponseMessage) -> Bool {
         switch (self.delegate, self.state) {
-        case (.client, .awaitingResponses) where self.infoRequestOutstanding:
-            // We're responding to a keyboard-interactive challenge. We stay in `.awaitingResponses`:
-            // the server may send further challenges, or conclude with success/failure.
-            self.infoRequestOutstanding = false
+        case (.client, .awaitingResponses)
+        where self.outstandingChallenge != nil && message.challengeID == self.outstandingChallenge:
+            // We're responding to the outstanding keyboard-interactive challenge. We stay in
+            // `.awaitingResponses`: the server may send further challenges, or conclude.
+            self.outstandingChallenge = nil
             return true
         case (.client, _):
             return false
@@ -587,6 +596,7 @@ extension UserAuthenticationStateMachine {
 
     fileprivate func requestKeyboardInteractiveResponse(
         request: SSHMessage.UserAuthInfoRequestMessage,
+        challengeID: UInt64,
         delegate: NIOSSHClientUserAuthenticationDelegate
     ) -> EventLoopFuture<SSHMessage.UserAuthInfoResponseMessage?> {
         let challenge = NIOSSHKeyboardInteractiveChallenge(request)
@@ -600,7 +610,7 @@ extension UserAuthenticationStateMachine {
                     "expected \(expectedResponses) response(s), delegate provided \(responses.count)"
                 )
             }
-            return SSHMessage.UserAuthInfoResponseMessage(responses: responses)
+            return SSHMessage.UserAuthInfoResponseMessage(responses: responses, challengeID: challengeID)
         }
     }
 }

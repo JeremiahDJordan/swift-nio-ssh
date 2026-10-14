@@ -1078,6 +1078,14 @@ final class SSHMessagesTests: XCTestCase {
         XCTAssertEqual(try buffer.readSSHMessage(keyboardInteractiveInfoRequestExpected: true), message)
     }
 
+    /// Keyboard-interactive answers are passwords and one-time codes: an error that quotes the
+    /// message (e.g. "Unexpected inbound message: …") must not quote them.
+    func testKeyboardInteractiveAnswersAreNotInDescriptions() throws {
+        let message = SSHMessage.userAuthInfoResponse(.init(responses: ["hunter2", "123456"]))
+        XCTAssertFalse("\(message)".contains("hunter2"), "\(message)")
+        XCTAssertFalse(String(reflecting: message).contains("hunter2"))
+    }
+
     func testAvailableMethodsParseKeyboardInteractive() throws {
         let failure = SSHMessage.UserAuthFailureMessage(
             authentications: ["password", "keyboard-interactive"],

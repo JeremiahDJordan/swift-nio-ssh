@@ -143,6 +143,25 @@ final class KeyboardInteractiveDelegate: NIOSSHClientUserAuthenticationDelegate 
     }
 }
 
+/// Offers keyboard-interactive and holds each challenge's promise for the test to complete.
+final class ManualKeyboardInteractiveDelegate: NIOSSHClientUserAuthenticationDelegate {
+    var promises: [EventLoopPromise<[String]>] = []
+
+    func nextAuthenticationType(
+        availableMethods: NIOSSHAvailableUserAuthenticationMethods,
+        nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
+    ) {
+        nextChallengePromise.succeed(.init(username: "foo", serviceName: "", offer: .keyboardInteractive(.init())))
+    }
+
+    func respondToKeyboardInteractiveChallenge(
+        _ challenge: NIOSSHKeyboardInteractiveChallenge,
+        responsePromise: EventLoopPromise<[String]>
+    ) {
+        self.promises.append(responsePromise)
+    }
+}
+
 /// An authentication delegate that denies some number of requests and then accepts exactly one and fails the rest.
 final class DenyThenAcceptDelegate: NIOSSHServerUserAuthenticationDelegate {
     let supportedAuthenticationMethods: NIOSSHAvailableUserAuthenticationMethods = .all
@@ -1545,6 +1564,60 @@ final class UserAuthenticationStateMachineTests: XCTestCase {
         XCTAssertThrowsError(try stateMachine.receiveUserAuthInfoRequest(challenge)) { error in
             XCTAssertEqual((error as? NIOSSHError)?.type, .protocolViolation)
         }
+    }
+
+    /// Review of 7daa7b5, finding 1: attempt 1's challenge is with the delegate; the server fails
+    /// the attempt but still allows keyboard-interactive; the client tries again and gets challenge
+    /// 2; then the answer to challenge 1 arrives. It must be dropped, and challenge 2's answer sent.
+    func testLateAnswerToASupersededChallengeIsNotSentToTheNextOne() throws {
+        let delegate = ManualKeyboardInteractiveDelegate()
+        var stateMachine = UserAuthenticationStateMachine(
+            role: .client(.init(userAuthDelegate: delegate, serverAuthDelegate: AcceptAllHostKeysDelegate())),
+            loop: self.loop,
+            sessionID: self.sessionID
+        )
+        XCTAssertNoThrow(try self.beginAuthentication(stateMachine: &stateMachine))
+        stateMachine.sendServiceRequest(.init(service: "ssh-userauth"))
+        let request = SSHMessage.UserAuthRequestMessage(
+            username: "foo",
+            service: "ssh-connection",
+            method: .keyboardInteractive(.init(languageTag: "", submethods: ""))
+        )
+        XCTAssertNoThrow(
+            try self.serviceAccepted(service: "ssh-userauth", nextMessage: request, stateMachine: &stateMachine)
+        )
+        stateMachine.sendUserAuthRequest(request)
+
+        let answers = NIOLoopBoundBox<[SSHMessage.UserAuthInfoResponseMessage]>([], eventLoop: self.loop)
+        let first = SSHMessage.UserAuthInfoRequestMessage(
+            name: "",
+            instruction: "",
+            languageTag: "",
+            prompts: [.init(prompt: "Password: ", echo: false)]
+        )
+        try XCTUnwrap(try stateMachine.receiveUserAuthInfoRequest(first)).whenSuccess {
+            if let answer = $0 { answers.value.append(answer) }
+        }
+
+        let failure = SSHMessage.UserAuthFailureMessage(authentications: ["keyboard-interactive"], partialSuccess: true)
+        try self.authFailed(failure: failure, nextMessage: request, stateMachine: &stateMachine)
+        stateMachine.sendUserAuthRequest(request)
+        let second = SSHMessage.UserAuthInfoRequestMessage(
+            name: "",
+            instruction: "",
+            languageTag: "",
+            prompts: [.init(prompt: "OTP: ", echo: true)]
+        )
+        try XCTUnwrap(try stateMachine.receiveUserAuthInfoRequest(second)).whenSuccess {
+            if let answer = $0 { answers.value.append(answer) }
+        }
+
+        delegate.promises[0].succeed(["late"])
+        self.loop.run()
+        XCTAssertFalse(stateMachine.sendUserAuthInfoResponse(answers.value[0]), "a superseded answer was sent")
+        delegate.promises[1].succeed(["123456"])
+        self.loop.run()
+        XCTAssertTrue(stateMachine.sendUserAuthInfoResponse(answers.value[1]), "the current answer was dropped")
     }
 
     func testKeyboardInteractiveDefaultDelegateFailsCleanly() throws {

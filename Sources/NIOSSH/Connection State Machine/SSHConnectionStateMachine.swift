@@ -1088,6 +1088,12 @@ struct SSHConnectionStateMachine {
                 try state.writeUserAuthInfoResponse(message, into: &buffer)
                 self.state = .userAuthentication(state)
 
+            case .userAuthInfoRequest where state.role.isServer:
+                // NIOSSH has no server-side keyboard-interactive and never emits this; serializing
+                // it lets tests play a server that challenges a client.
+                try state.serializer.serialize(message: message, to: &buffer)
+                self.state = .userAuthentication(state)
+
             case .userAuthSuccess:
                 try state.writeUserAuthSuccess(into: &buffer)
                 // Ok we're good to go!
