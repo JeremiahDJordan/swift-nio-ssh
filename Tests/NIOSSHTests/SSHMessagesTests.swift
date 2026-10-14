@@ -748,13 +748,11 @@ final class SSHMessagesTests: XCTestCase {
 
         XCTAssertNil(try buffer.readSSHMessage())
 
-        // Unknown message types should be ignored, not throw (per RFC 4253 Section 11.1)
+        // Unknown message types are reported, not thrown, so the connection can answer
+        // them with SSH_MSG_UNIMPLEMENTED (RFC 4253 §11.4).
         buffer.writeBytes([127])
         let message = try buffer.readSSHMessage()
-        guard case .some(.ignore) = message else {
-            XCTFail("Expected .ignore for unknown message type")
-            return
-        }
+        XCTAssertEqual(message, .unrecognized(.init(type: 127, sequenceNumber: 0)))
     }
 
     func testRequestSuccess() throws {
@@ -863,9 +861,10 @@ final class SSHMessagesTests: XCTestCase {
         }
     }
 
-    func testUnknownMessageTypeReturnsIgnore() throws {
-        // This test verifies that unknown SSH message types are handled gracefully
-        // by returning .ignore() instead of throwing an error (per RFC 4253 Section 11.1).
+    func testUnknownMessageTypeIsReportedAsUnrecognized() throws {
+        // Unknown SSH message types are handled gracefully: the payload is consumed and the
+        // type is reported, so the connection can answer with SSH_MSG_UNIMPLEMENTED
+        // (RFC 4253 §11.4). The sequence number is the packet parser's to fill in.
         var buffer = ByteBufferAllocator().buffer(capacity: 100)
 
         // Use message ID 127 (reserved for local/private use per RFC 4253)
@@ -873,14 +872,26 @@ final class SSHMessagesTests: XCTestCase {
         buffer.writeSSHString("extension-data".utf8)
 
         let message = try buffer.readSSHMessage()
-
-        guard case .some(.ignore) = message else {
-            XCTFail("Expected .ignore for unknown message type, got \(String(describing: message))")
-            return
-        }
+        XCTAssertEqual(message, .unrecognized(.init(type: 127, sequenceNumber: 0)))
 
         // Verify buffer is fully consumed
         XCTAssertEqual(buffer.readableBytes, 0, "Parser should consume all bytes for unknown message type")
+    }
+
+    func testEveryUnassignedMessageTypeIsUnrecognized() throws {
+        // Every type byte this implementation has no parser for, and only those, comes back
+        // as `.unrecognized` carrying that byte.
+        let known: Set<UInt8> = [
+            1, 2, 3, 4, 5, 6, 20, 21, 30, 31, 50, 51, 52, 53, 60, 80, 81, 82,
+            90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100,
+        ]
+        for type in UInt8.min...UInt8.max where !known.contains(type) {
+            var buffer = ByteBufferAllocator().buffer(capacity: 8)
+            buffer.writeInteger(type)
+            buffer.writeInteger(UInt32(0xDEAD_BEEF))
+            XCTAssertEqual(try buffer.readSSHMessage(), .unrecognized(.init(type: type, sequenceNumber: 0)))
+            XCTAssertEqual(buffer.readableBytes, 0)
+        }
     }
 
     func testParserStateAfterUnknownMessageType() throws {
@@ -893,12 +904,9 @@ final class SSHMessagesTests: XCTestCase {
         buffer.writeInteger(UInt8(125))
         buffer.writeBytes([1, 2, 3, 4])  // Some payload
 
-        // Read unknown message (should return .ignore)
+        // Read unknown message (should return .unrecognized)
         let message1 = try buffer.readSSHMessage()
-        guard case .some(.ignore) = message1 else {
-            XCTFail("Expected .ignore for unknown message type")
-            return
-        }
+        XCTAssertEqual(message1, .unrecognized(.init(type: 125, sequenceNumber: 0)))
 
         // Write known message
         buffer.writeInteger(SSHMessage.ChannelSuccessMessage.id)

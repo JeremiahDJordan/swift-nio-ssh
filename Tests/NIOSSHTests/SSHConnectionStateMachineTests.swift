@@ -719,8 +719,8 @@ final class SSHConnectionStateMachineTests: XCTestCase {
     /// Strict key exchange (CVE-2023-48795, "Terrapin"): once both peers propose the
     /// marker, nothing but the key exchange messages themselves may appear between
     /// KEXINIT and NEWKEYS. SSH_MSG_IGNORE is the packet the attack injects to shift the
-    /// sequence numbers, and unknown message types reach the same case (this fork maps
-    /// them to SSH_MSG_IGNORE, see docs/FORK.md #224), so both are refused here.
+    /// sequence numbers; unknown message types are refused the same way
+    /// (`testStrictKeyExchangeRefusesUnrecognizedMessagesDuringKeyExchange`).
     func testStrictKeyExchangeRefusesIgnoreDuringKeyExchange() throws {
         let allocator = ByteBufferAllocator()
         let loop = EmbeddedEventLoop()
@@ -1133,6 +1133,162 @@ final class SSHConnectionStateMachineTests: XCTestCase {
             )
             try send(toClient, from: &server, to: &client)
         }
+    }
+
+    /// RFC 4253 §11.4: an unrecognised message is answered with SSH_MSG_UNIMPLEMENTED
+    /// quoting the sequence number of the packet that carried it, in order, and the
+    /// connection carries on. Both directions, over a scheme whose MAC binds the
+    /// sequence number, so a reply quoting the wrong one cannot hide behind a working MAC.
+    func testUnrecognizedMessagesAreAnsweredWithUnimplemented() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        let schemes: [NIOSSHTransportProtection.Type] = [SequenceNumberBoundTransportProtection.self]
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            ),
+            protectionSchemes: schemes
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            ),
+            protectionSchemes: schemes
+        )
+        try assertSuccessfulConnection(client: &client, server: &server, allocator: allocator, loop: loop)
+
+        func send(
+            _ message: SSHMessage,
+            from sender: inout SSHConnectionStateMachine,
+            to receiver: inout SSHConnectionStateMachine
+        ) throws -> SSHConnectionStateMachine.StateMachineInboundProcessResult? {
+            var buffer = allocator.buffer(capacity: 64)
+            try sender.processOutboundMessage(message, buffer: &buffer, allocator: allocator, loop: loop)
+            receiver.bufferInboundData(&buffer)
+            return try receiver.processInboundMessage(allocator: allocator, loop: loop)
+        }
+        func assertAnswered(
+            _ result: SSHConnectionStateMachine.StateMachineInboundProcessResult?,
+            sequenceNumber: UInt32,
+            line: UInt = #line
+        ) {
+            guard case .some(.emitMessage(let reply)) = result else {
+                return XCTFail("expected SSH_MSG_UNIMPLEMENTED, got \(String(describing: result))", line: line)
+            }
+            XCTAssertEqual(Array(reply), [.unimplemented(.init(sequenceNumber: sequenceNumber))], line: line)
+        }
+        let unknown = SSHMessage.unrecognized(.init(type: 200, sequenceNumber: 0))
+        let ignore = SSHMessage.ignore(.init(data: allocator.buffer(capacity: 0)))
+
+        // Strict key exchange reset both send counters at NEWKEYS. Since then the client has
+        // sent SERVICE_REQUEST and two USERAUTH_REQUESTs (the first is denied) and the server
+        // SERVICE_ACCEPT, USERAUTH_FAILURE and USERAUTH_SUCCESS: each side's next packet is 3.
+        assertAnswered(try send(unknown, from: &server, to: &client), sequenceNumber: 3)
+        XCTAssertNotNil(try send(ignore, from: &server, to: &client))
+        assertAnswered(try send(unknown, from: &server, to: &client), sequenceNumber: 5)
+        assertAnswered(try send(unknown, from: &client, to: &server), sequenceNumber: 3)
+
+        // The connection is unharmed.
+        try self.assertDataFlowsBothWays(client: &client, server: &server, allocator: allocator, loop: loop)
+
+        // And the reply is a well-formed SSH_MSG_UNIMPLEMENTED on the wire: the peer that
+        // sent the unknown message reads back the sequence number it was sent under.
+        guard case .some(.emitMessage(let reply)) = try send(unknown, from: &server, to: &client) else {
+            return XCTFail("expected a reply")
+        }
+        var wire = allocator.buffer(capacity: 64)
+        for message in reply {
+            try client.processOutboundMessage(message, buffer: &wire, allocator: allocator, loop: loop)
+        }
+        server.bufferInboundData(&wire)
+        XCTAssertThrowsError(try server.processInboundMessage(allocator: allocator, loop: loop)) { error in
+            XCTAssertEqual((error as? NIOSSHError)?.type, .remotePeerDoesNotSupportMessage)
+            // 3 and 5 above, the data exchange took 6 to 9, so this one was 10.
+            XCTAssertTrue("\(error)".contains("Sequence Number: 10"), "\(error)")
+        }
+    }
+
+    /// Under strict key exchange an unknown message type during the initial key exchange is
+    /// as injectable as SSH_MSG_IGNORE, so it is refused rather than answered — and the
+    /// violation names the type byte only.
+    func testStrictKeyExchangeRefusesUnrecognizedMessagesDuringKeyExchange() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            )
+        )
+        try self.exchangeVersionsAndKexInits(client: &client, server: &server, allocator: allocator, loop: loop)
+
+        var injected = allocator.buffer(capacity: 32)
+        try server.processOutboundMessage(
+            .unrecognized(.init(type: 200, sequenceNumber: 0)),
+            buffer: &injected,
+            allocator: allocator,
+            loop: loop
+        )
+        client.bufferInboundData(&injected)
+        XCTAssertThrowsError(try client.processInboundMessage(allocator: allocator, loop: loop)) { error in
+            XCTAssertEqual((error as? NIOSSHError)?.type, .protocolViolation)
+            XCTAssertTrue("\(error)".contains("strict key exchange"), "\(error)")
+            XCTAssertTrue("\(error)".contains("unknown type 200"), "\(error)")
+        }
+    }
+
+    /// Without strict key exchange the same message is answered, in cleartext, with the
+    /// sequence number of the packet after the peer's KEXINIT (packet 0).
+    func testUnrecognizedMessageDuringKeyExchangeWithoutStrictModeIsAnswered() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            ),
+            implementsStrictKeyExchange: false
+        )
+        try self.exchangeVersionsAndKexInits(client: &client, server: &server, allocator: allocator, loop: loop)
+
+        var injected = allocator.buffer(capacity: 32)
+        try server.processOutboundMessage(
+            .unrecognized(.init(type: 200, sequenceNumber: 0)),
+            buffer: &injected,
+            allocator: allocator,
+            loop: loop
+        )
+        client.bufferInboundData(&injected)
+        guard case .some(.emitMessage(let reply)) = try client.processInboundMessage(allocator: allocator, loop: loop)
+        else {
+            return XCTFail("expected SSH_MSG_UNIMPLEMENTED")
+        }
+        XCTAssertEqual(Array(reply), [.unimplemented(.init(sequenceNumber: 1))])
+        // The client may send it mid-key-exchange (RFC 4253 §7.1 allows transport generic messages).
+        var wire = allocator.buffer(capacity: 32)
+        for message in reply {
+            XCTAssertNoThrow(
+                try client.processOutboundMessage(message, buffer: &wire, allocator: allocator, loop: loop)
+            )
+        }
+        XCTAssertGreaterThan(wire.readableBytes, 0)
     }
 
     func testUnimplementedGivesARichError() throws {

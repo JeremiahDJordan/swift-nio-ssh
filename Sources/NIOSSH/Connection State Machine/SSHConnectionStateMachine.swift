@@ -174,13 +174,19 @@ struct SSHConnectionStateMachine {
                         // Strict key exchange (CVE-2023-48795): during the initial key exchange
                         // nothing but the key exchange messages themselves may appear, because
                         // anything tolerated here can be injected by an attacker to shift the
-                        // sequence numbers the transcript is bound to. Unknown message types
-                        // arrive here too (they are treated as SSH_MSG_IGNORE).
+                        // sequence numbers the transcript is bound to.
                         guard state.toleratesNonKeyExchangeMessages else {
                             throw SSHConnectionStateMachine.strictKeyExchangeViolation(message)
                         }
                         self = .keyExchange(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        // Strict key exchange: an unknown type is as injectable as SSH_MSG_IGNORE.
+                        guard state.toleratesNonKeyExchangeMessages else {
+                            throw SSHConnectionStateMachine.strictKeyExchangeViolation(message)
+                        }
+                        self = .keyExchange(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
                     default:
@@ -243,6 +249,13 @@ struct SSHConnectionStateMachine {
                         }
                         self = .sentNewKeys(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        // Strict key exchange: an unknown type is as injectable as SSH_MSG_IGNORE.
+                        guard state.toleratesNonKeyExchangeMessages else {
+                            throw SSHConnectionStateMachine.strictKeyExchangeViolation(message)
+                        }
+                        self = .sentNewKeys(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
 
@@ -300,6 +313,13 @@ struct SSHConnectionStateMachine {
                         }
                         self = .receivedNewKeys(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        // Strict key exchange: an unknown type is as injectable as SSH_MSG_IGNORE.
+                        guard state.toleratesNonKeyExchangeMessages else {
+                            throw SSHConnectionStateMachine.strictKeyExchangeViolation(message)
+                        }
+                        self = .receivedNewKeys(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
 
                     case .serviceAccept, .userAuthRequest, .userAuthSuccess, .userAuthFailure:
                         throw NIOSSHError.protocolViolation(
@@ -369,6 +389,9 @@ struct SSHConnectionStateMachine {
                         // Ignore these
                         self = .userAuthentication(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        self = .userAuthentication(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
 
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
@@ -439,6 +462,9 @@ struct SSHConnectionStateMachine {
                         // Ignore these
                         self = .active(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        self = .active(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
 
@@ -481,6 +507,9 @@ struct SSHConnectionStateMachine {
                         // Ignore these
                         self = .receivedKexInitWhenActive(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        self = .receivedKexInitWhenActive(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
                     default:
@@ -565,6 +594,9 @@ struct SSHConnectionStateMachine {
                         // Ignore these
                         self = .sentKexInitWhenActive(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        self = .sentKexInitWhenActive(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
 
@@ -615,6 +647,9 @@ struct SSHConnectionStateMachine {
                         // Ignore these
                         self = .rekeying(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        self = .rekeying(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
                     default:
@@ -696,6 +731,9 @@ struct SSHConnectionStateMachine {
                         // Ignore these
                         self = .rekeyingReceivedNewKeysState(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        self = .rekeyingReceivedNewKeysState(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
 
@@ -746,6 +784,9 @@ struct SSHConnectionStateMachine {
                         // Ignore these
                         self = .rekeyingSentNewKeysState(state)
                         return .noMessage
+                    case .unrecognized(let unrecognized):
+                        self = .rekeyingSentNewKeysState(state)
+                        return SSHConnectionStateMachine.unimplementedReply(to: unrecognized)
                     case .unimplemented(let unimplemented):
                         throw NIOSSHError.remotePeerDoesNotSupportMessage(unimplemented)
 
@@ -783,6 +824,16 @@ struct SSHConnectionStateMachine {
         }
     }
 
+    /// RFC 4253 §11.4: "An implementation MUST respond to all unrecognized messages with an
+    /// SSH_MSG_UNIMPLEMENTED message in the order in which the messages were received. Such
+    /// messages MUST be otherwise ignored." The reply quotes the sequence number of the packet
+    /// that carried the message, which `SSHPacketParser` stamped on it.
+    private static func unimplementedReply(
+        to message: SSHMessage.UnrecognizedMessage
+    ) -> StateMachineInboundProcessResult {
+        .emitMessage(SSHMultiMessage(.unimplemented(.init(sequenceNumber: message.sequenceNumber))))
+    }
+
     /// The message type, and never its contents: `SSH_MSG_DEBUG` carries an
     /// unbounded, attacker-chosen string sent before authentication, and this
     /// violation travels verbatim into the application's user-facing connection
@@ -794,6 +845,8 @@ struct SSHConnectionStateMachine {
             type = "SSH_MSG_DEBUG"
         case .ignore:
             type = "SSH_MSG_IGNORE"
+        case .unrecognized(let message):
+            type = "message of unknown type \(message.type)"
         default:
             type = "message"
         }
@@ -901,7 +954,7 @@ struct SSHConnectionStateMachine {
                 try kex.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(kex.role)
 
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try kex.serializer.serialize(message: message, to: &buffer)
                 self.state = .keyExchange(kex)
 
@@ -944,7 +997,7 @@ struct SSHConnectionStateMachine {
                 try kex.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(kex.role)
 
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try kex.serializer.serialize(message: message, to: &buffer)
                 self.state = .receivedNewKeys(kex)
 
@@ -973,7 +1026,7 @@ struct SSHConnectionStateMachine {
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(state.role)
 
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentNewKeys(state)
 
@@ -1020,7 +1073,7 @@ struct SSHConnectionStateMachine {
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(state.role)
 
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .userAuthentication(state)
 
@@ -1065,7 +1118,7 @@ struct SSHConnectionStateMachine {
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(state.role)
                 return
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try state.serializer.serialize(message: message, to: &buffer)
             default:
                 throw NIOSSHError.protocolViolation(
@@ -1087,7 +1140,7 @@ struct SSHConnectionStateMachine {
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(state.role)
 
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .receivedKexInitWhenActive(state)
 
@@ -1105,7 +1158,7 @@ struct SSHConnectionStateMachine {
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(state.role)
 
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentKexInitWhenActive(state)
 
@@ -1136,7 +1189,7 @@ struct SSHConnectionStateMachine {
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(state.role)
 
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .rekeying(state)
 
@@ -1167,7 +1220,7 @@ struct SSHConnectionStateMachine {
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(state.role)
 
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .rekeyingReceivedNewKeysState(state)
 
@@ -1213,7 +1266,7 @@ struct SSHConnectionStateMachine {
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .sentDisconnect(state.role)
                 return
-            case .ignore, .debug, .unimplemented:
+            case .ignore, .debug, .unimplemented, .unrecognized:
                 try state.serializer.serialize(message: message, to: &buffer)
                 self.state = .rekeyingSentNewKeysState(state)
             default:

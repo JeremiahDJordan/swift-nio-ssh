@@ -129,8 +129,7 @@ struct SSHPacketParser {
             if let length = self.buffer.getInteger(at: self.buffer.readerIndex, as: UInt32.self) {
                 if let message = try self.parsePlaintext(length: length) {
                     self.state = .cleartextWaitingForLength
-                    self.sequenceNumber &+= 1
-                    return message
+                    return self.countingPacket(message)
                 }
                 self.state = .cleartextWaitingForBytes(length)
                 return nil
@@ -139,8 +138,7 @@ struct SSHPacketParser {
         case .cleartextWaitingForBytes(let length):
             if let message = try self.parsePlaintext(length: length) {
                 self.state = .cleartextWaitingForLength
-                self.sequenceNumber &+= 1
-                return message
+                return self.countingPacket(message)
             }
             return nil
         case .encryptedWaitingForLength(let protection):
@@ -150,19 +148,29 @@ struct SSHPacketParser {
 
             if let message = try self.parseCiphertext(length: length, protection: protection) {
                 self.state = .encryptedWaitingForLength(protection)
-                self.sequenceNumber &+= 1
-                return message
+                return self.countingPacket(message)
             }
             self.state = .encryptedWaitingForBytes(length, protection)
             return nil
         case .encryptedWaitingForBytes(let length, let protection):
             if let message = try self.parseCiphertext(length: length, protection: protection) {
                 self.state = .encryptedWaitingForLength(protection)
-                self.sequenceNumber &+= 1
-                return message
+                return self.countingPacket(message)
             }
             return nil
         }
+    }
+
+    /// Advances the receive sequence number past the packet that carried `message`.
+    /// An unrecognised message is first stamped with that packet's sequence number,
+    /// which is what the `SSH_MSG_UNIMPLEMENTED` answering it must quote (RFC 4253 §11.4).
+    private mutating func countingPacket(_ message: SSHMessage) -> SSHMessage {
+        defer { self.sequenceNumber &+= 1 }
+        guard case .unrecognized(var unrecognized) = message else {
+            return message
+        }
+        unrecognized.sequenceNumber = self.sequenceNumber
+        return .unrecognized(unrecognized)
     }
 
     private mutating func reclaimBytes() {

@@ -52,6 +52,7 @@ enum SSHMessage: Equatable {
     case channelRequest(ChannelRequestMessage)
     case channelSuccess(ChannelSuccessMessage)
     case channelFailure(ChannelFailureMessage)
+    case unrecognized(UnrecognizedMessage)
 }
 
 extension SSHMessage {
@@ -72,6 +73,21 @@ extension SSHMessage {
     struct UnimplementedMessage: Equatable {
         static let id: UInt8 = 3
 
+        var sequenceNumber: UInt32
+    }
+
+    /// A message whose type this implementation does not recognise (RFC 4253 §11.4).
+    ///
+    /// Its payload is consumed and dropped; the connection answers it with
+    /// `SSH_MSG_UNIMPLEMENTED` quoting `sequenceNumber`. It is never part of a protocol
+    /// exchange we start: serializing one writes the bare type byte, which only tests use
+    /// (to play a peer that speaks an extension we do not).
+    struct UnrecognizedMessage: Equatable {
+        /// The message type byte.
+        var type: UInt8
+
+        /// The sequence number of the packet that carried the message. `readSSHMessage()`
+        /// cannot know it and leaves it zero; `SSHPacketParser` fills it in.
         var sequenceNumber: UInt32
     }
 
@@ -509,13 +525,12 @@ extension ByteBuffer {
                 }
                 return .channelFailure(message)
             default:
-                // Unknown SSH message type - consume remaining bytes and return as ignore.
-                // This prevents parser state corruption when encountering extension messages
-                // (e.g. hostkeys-00@openssh.com) that NIOSSH doesn't support. Without this,
-                // the parser would throw, rewind the buffer reader over already-decrypted data,
-                // and skip incrementing the sequence number, causing cascading MAC failures.
+                // Unknown SSH message type: consume the rest of the payload and report the type,
+                // so the connection can answer with SSH_MSG_UNIMPLEMENTED (RFC 4253 §11.4).
+                // Throwing here instead would rewind the reader over already-decrypted bytes
+                // and skip the sequence-number increment, so every later MAC would fail.
                 self.moveReaderIndex(to: self.writerIndex)
-                return .ignore(.init(data: ByteBuffer()))
+                return .unrecognized(.init(type: type, sequenceNumber: 0))
             }
         }
     }
@@ -1199,6 +1214,8 @@ extension ByteBuffer {
         case .unimplemented(let message):
             writtenBytes += self.writeInteger(SSHMessage.UnimplementedMessage.id)
             writtenBytes += self.writeUnimplementedMessage(message)
+        case .unrecognized(let message):
+            writtenBytes += self.writeInteger(message.type)
         case .debug(let message):
             writtenBytes += self.writeInteger(SSHMessage.DebugMessage.id)
             writtenBytes += self.writeDebugMessage(message)

@@ -79,6 +79,57 @@ final class SSHPacketParserTests: XCTestCase {
         }
     }
 
+    /// RFC 4253 §11.4: SSH_MSG_UNIMPLEMENTED quotes the sequence number of the packet that
+    /// carried the unrecognised message. The parser stamps it on, in cleartext and after
+    /// encryption is installed (with and without the strict-KEX reset), and the counter
+    /// still advances past the packet.
+    func testUnrecognizedMessagesCarryTheirPacketSequenceNumber() throws {
+        let allocator = ByteBufferAllocator()
+
+        for strict in [false, true] {
+            var serializer = SSHPacketSerializer()
+            var parser = SSHPacketParser(isServer: false, allocator: allocator)
+            self.feedVersion(to: &parser)
+            var versionBuffer = allocator.buffer(capacity: 32)
+            XCTAssertNoThrow(try serializer.serialize(message: .version(Constants.version), to: &versionBuffer))
+
+            func roundTrip(_ message: SSHMessage) throws -> SSHMessage? {
+                var buffer = allocator.buffer(capacity: 64)
+                try serializer.serialize(message: message, to: &buffer)
+                parser.append(bytes: &buffer)
+                return try parser.nextPacket()
+            }
+            let unknown = SSHMessage.unrecognized(.init(type: 200, sequenceNumber: 0xFFFF_FFFF))
+
+            // Cleartext: packets 0 and 1 are known, packet 2 is not.
+            XCTAssertNotNil(try roundTrip(.ignore(.init(data: allocator.buffer(capacity: 0)))))
+            XCTAssertNotNil(try roundTrip(.ignore(.init(data: allocator.buffer(capacity: 0)))))
+            XCTAssertEqual(try roundTrip(unknown), .unrecognized(.init(type: 200, sequenceNumber: 2)))
+            XCTAssertEqual(3, parser.sequenceNumber)
+
+            // Encrypted, with a scheme whose MAC binds the sequence number, so the parser
+            // and serializer agreeing on it is part of what is checked.
+            let keys = NIOSSHSessionKeys(
+                initialInboundIV: [],
+                initialOutboundIV: [],
+                inboundEncryptionKey: SymmetricKey(data: Array(repeating: 1, count: 16)),
+                outboundEncryptionKey: SymmetricKey(data: Array(repeating: 1, count: 16)),
+                inboundMACKey: SymmetricKey(data: Array(repeating: 2, count: 16)),
+                outboundMACKey: SymmetricKey(data: Array(repeating: 2, count: 16))
+            )
+            serializer.addEncryption(
+                SequenceNumberBoundTransportProtection(initialKeys: keys),
+                resetSequenceNumber: strict
+            )
+            parser.addEncryption(SequenceNumberBoundTransportProtection(initialKeys: keys), resetSequenceNumber: strict)
+            let first: UInt32 = strict ? 0 : 3
+            XCTAssertEqual(try roundTrip(unknown), .unrecognized(.init(type: 200, sequenceNumber: first)))
+            XCTAssertNotNil(try roundTrip(.ignore(.init(data: allocator.buffer(capacity: 0)))))
+            XCTAssertEqual(try roundTrip(unknown), .unrecognized(.init(type: 200, sequenceNumber: first + 2)))
+            XCTAssertEqual(first + 3, parser.sequenceNumber, "strict: \(strict)")
+        }
+    }
+
     func testReadVersion() throws {
         var parser = SSHPacketParser(isServer: false, allocator: ByteBufferAllocator())
 
