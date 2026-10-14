@@ -12,6 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+import NIOCore
+
 /// Configuration for an SSH client.
 public struct SSHClientConfiguration {
     /// The user authentication delegate to be used with this client.
@@ -50,6 +52,12 @@ public struct SSHClientConfiguration {
         }
     }
 
+    /// Client keepalive: `keepalive@openssh.com` probes after a quiet interval, and a limit on
+    /// unanswered ones (OpenSSH's `ServerAliveInterval` and `ServerAliveCountMax`). `nil`, the
+    /// default, sends none. ``NIOSSHHandler/sendKeepAlive(promise:)`` sends one on demand
+    /// whether or not this is set.
+    public var keepAlive: SSHKeepAliveConfiguration? = nil
+
     public init(
         userAuthDelegate: NIOSSHClientUserAuthenticationDelegate,
         serverAuthDelegate: NIOSSHClientServerAuthenticationDelegate,
@@ -73,6 +81,30 @@ public struct SSHClientConfiguration {
         self.serverAuthDelegate = serverAuthDelegate
         self.globalRequestDelegate = globalRequestDelegate ?? DefaultGlobalRequestDelegate()
         self.transportProtectionSchemes = transportProtectionSchemes
+    }
+}
+
+/// Client keepalive settings, as OpenSSH's `ServerAliveInterval` and `ServerAliveCountMax`.
+///
+/// Once user authentication has succeeded, each `interval` in which nothing arrived from the
+/// server sends a `keepalive@openssh.com` global request asking for a reply. Any reply (servers
+/// answer this unknown request with `SSH_MSG_REQUEST_FAILURE`) proves the server alive and resets
+/// the count. When `maximumUnansweredProbes` probes are unanswered at the next quiet interval, the
+/// handler fires ``NIOSSHError/ErrorType/keepAliveTimeout`` and closes the connection: a dead peer
+/// is noticed after about `interval × (maximumUnansweredProbes + 1)` of silence.
+public struct SSHKeepAliveConfiguration: Hashable, Sendable {
+    /// The quiet time before a probe is sent, and between probes. Must be positive.
+    public var interval: TimeAmount
+
+    /// The number of unanswered probes tolerated; the next quiet interval closes the connection.
+    /// Must be at least 1.
+    public var maximumUnansweredProbes: Int
+
+    public init(interval: TimeAmount, maximumUnansweredProbes: Int = 3) {
+        precondition(interval > .zero, "keepalive interval must be positive")
+        precondition(maximumUnansweredProbes >= 1, "keepalive must tolerate at least one unanswered probe")
+        self.interval = interval
+        self.maximumUnansweredProbes = maximumUnansweredProbes
     }
 }
 

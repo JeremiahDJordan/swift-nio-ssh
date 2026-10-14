@@ -63,6 +63,12 @@ public final class NIOSSHHandler {
 
     private var pendingGlobalRequestResponses: CircularBuffer<PendingGlobalRequestResponse?>
 
+    /// Client keepalive (`SSHClientConfiguration.keepAlive`): the next check, the probes sent and
+    /// not yet answered, and when anything last arrived from the server.
+    private var keepAliveCheck: Scheduled<Void>?
+    private var unansweredKeepAlives = 0
+    private var lastReadTime: NIODeadline = .uptimeNanoseconds(0)
+
     /// Construct a new ``NIOSSHHandler``.
     ///
     /// - parameters:
@@ -132,6 +138,7 @@ extension NIOSSHHandler: ChannelDuplexHandler {
 
     public func handlerRemoved(context: ChannelHandlerContext) {
         self.context = nil
+        self.stopKeepAlive()
 
         // We don't actually need to nil out the multiplexer here (it will nil its reference to us)
         // but we _can_, and it doesn't hurt.
@@ -164,6 +171,7 @@ extension NIOSSHHandler: ChannelDuplexHandler {
     }
 
     public func channelInactive(context: ChannelHandlerContext) {
+        self.stopKeepAlive()
         self.multiplexer?.parentChannelInactive()
     }
 
@@ -174,6 +182,7 @@ extension NIOSSHHandler: ChannelDuplexHandler {
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         self.expectingChannelReadComplete = true
+        self.lastReadTime = context.eventLoop.now
 
         var data = self.unwrapInboundIn(data)
         self.stateMachine.bufferInboundData(&data)
@@ -201,6 +210,7 @@ extension NIOSSHHandler: ChannelDuplexHandler {
 
         self.createPendingChannelsIfPossible()
         self.sendGlobalRequestsIfPossible()
+        self.startKeepAliveIfNeeded(context: context)
     }
 
     private func writeMessage(
@@ -505,6 +515,100 @@ extension NIOSSHHandler {
         } catch {
             writePromise.fail(error)
         }
+    }
+}
+
+// MARK: Keepalive
+
+extension NIOSSHHandler {
+    /// Sends one `keepalive@openssh.com` global request asking for a reply, and succeeds `promise`
+    /// when the server answers. Any answer counts: servers reply `SSH_MSG_REQUEST_FAILURE` to this
+    /// request, which proves the connection alive as well as a success would. The promise fails if
+    /// the connection closes first. Before user authentication completes the probe is queued, as
+    /// every global request is. This is the on-demand form of ``SSHClientConfiguration/keepAlive``;
+    /// a caller that wants a deadline schedules its own.
+    ///
+    /// This function is **not** thread-safe: it may only be called from on the channel.
+    public func sendKeepAlive(promise: EventLoopPromise<Void>? = nil) {
+        guard let context = self.context else {
+            promise?.fail(ChannelError.ioOnClosedChannel)
+            return
+        }
+        let answer = context.eventLoop.makePromise(of: ByteBuffer?.self)
+        answer.futureResult.assumeIsolated().whenComplete { result in
+            switch result {
+            case .success:
+                self.unansweredKeepAlives = 0
+                promise?.succeed(())
+            case .failure(let error as NIOSSHError) where error.type == .globalRequestRefused:
+                self.unansweredKeepAlives = 0
+                promise?.succeed(())
+            case .failure(let error):
+                promise?.fail(error)
+            }
+        }
+        self.sendGlobalRequestMessage(Self.keepAliveRequest, promise: answer)
+    }
+
+    private static let keepAliveRequest = SSHMessage.GlobalRequestMessage(
+        wantReply: true,
+        type: .unknown("keepalive@openssh.com", ByteBuffer())
+    )
+
+    private var keepAliveConfiguration: SSHKeepAliveConfiguration? {
+        guard case .client(let configuration) = self.stateMachine.role else {
+            return nil
+        }
+        return configuration.keepAlive
+    }
+
+    /// Starts the periodic check once user authentication has completed.
+    private func startKeepAliveIfNeeded(context: ChannelHandlerContext) {
+        guard self.keepAliveCheck == nil, let configuration = self.keepAliveConfiguration,
+            self.stateMachine.hasActivated, !self.stateMachine.disconnected
+        else {
+            return
+        }
+        self.lastReadTime = context.eventLoop.now
+        self.scheduleKeepAliveCheck(at: self.lastReadTime + configuration.interval, context: context)
+    }
+
+    private func scheduleKeepAliveCheck(at deadline: NIODeadline, context: ChannelHandlerContext) {
+        self.keepAliveCheck = context.eventLoop.assumeIsolated().scheduleTask(deadline: deadline) {
+            self.keepAliveCheckDue()
+        }
+    }
+
+    /// OpenSSH's `server_alive_check`: a probe goes out once `interval` has passed with nothing
+    /// from the server (anything that arrives, the answer to a probe included, restarts the wait);
+    /// with the limit of unanswered probes reached, give up on the server instead.
+    private func keepAliveCheckDue() {
+        self.keepAliveCheck = nil
+        guard let context = self.context, let configuration = self.keepAliveConfiguration,
+            !self.stateMachine.disconnected
+        else {
+            return
+        }
+
+        let now = context.eventLoop.now
+        let quietUntil = self.lastReadTime + configuration.interval
+        guard now >= quietUntil else {
+            self.scheduleKeepAliveCheck(at: quietUntil, context: context)
+            return
+        }
+        guard self.unansweredKeepAlives < configuration.maximumUnansweredProbes else {
+            context.fireErrorCaught(NIOSSHError.keepAliveTimeout(unansweredProbes: self.unansweredKeepAlives))
+            context.close(promise: nil)
+            return
+        }
+        self.unansweredKeepAlives += 1
+        self.sendKeepAlive(promise: nil)
+        self.scheduleKeepAliveCheck(at: now + configuration.interval, context: context)
+    }
+
+    private func stopKeepAlive() {
+        self.keepAliveCheck?.cancel()
+        self.keepAliveCheck = nil
     }
 }
 

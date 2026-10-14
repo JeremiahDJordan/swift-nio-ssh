@@ -180,6 +180,14 @@ extension NIOSSHError {
     internal static func invalidKeyboardInteractiveResponse(_ diagnostics: String) -> NIOSSHError {
         NIOSSHError(type: .invalidKeyboardInteractiveResponse, diagnostics: diagnostics)
     }
+
+    @inline(never)
+    internal static func keepAliveTimeout(unansweredProbes: Int) -> NIOSSHError {
+        NIOSSHError(
+            type: .keepAliveTimeout,
+            diagnostics: "server not responding: \(unansweredProbes) keepalive probes unanswered"
+        )
+    }
 }
 
 // MARK: - NIOSSHError CustomStringConvertible conformance.
@@ -228,6 +236,7 @@ extension NIOSSHError {
             case invalidCertificate
             case unsupportedUserAuthenticationMethod
             case invalidKeyboardInteractiveResponse
+            case keepAliveTimeout
         }
 
         private var base: Base
@@ -336,6 +345,10 @@ extension NIOSSHError {
         public static let invalidKeyboardInteractiveResponse: ErrorType = .init(
             .invalidKeyboardInteractiveResponse
         )
+
+        /// The server did not answer the configured number of `keepalive@openssh.com` probes
+        /// (``SSHClientConfiguration/keepAlive``); the connection is closed.
+        public static let keepAliveTimeout: ErrorType = .init(.keepAliveTimeout)
     }
 }
 
