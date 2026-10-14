@@ -38,6 +38,8 @@ enum SSHMessage: Equatable {
     case userAuthSuccess
     case userAuthBanner(UserAuthBannerMessage)
     case userAuthPKOK(UserAuthPKOKMessage)
+    case userAuthInfoRequest(UserAuthInfoRequestMessage)
+    case userAuthInfoResponse(UserAuthInfoResponseMessage)
     case globalRequest(GlobalRequestMessage)
     case requestSuccess(RequestSuccessMessage)
     case requestFailure
@@ -162,11 +164,18 @@ extension SSHMessage {
             case none
             case publicKey(PublicKeyAuthType)
             case password(String)
+            case keyboardInteractive(KeyboardInteractive)
         }
 
         enum PublicKeyAuthType: Equatable {
             case known(key: NIOSSHPublicKey, signature: NIOSSHSignature?)
             case unknown
+        }
+
+        /// The payload of an RFC 4256 `keyboard-interactive` initial authentication request.
+        struct KeyboardInteractive: Equatable {
+            var languageTag: String
+            var submethods: String
         }
 
         var username: String
@@ -202,6 +211,42 @@ extension SSHMessage {
         static let id: UInt8 = 60
 
         var key: NIOSSHPublicKey
+    }
+
+    /// SSH_MSG_USERAUTH_INFO_REQUEST, sent by the server during RFC 4256 `keyboard-interactive`
+    /// authentication.
+    ///
+    /// - Note: This message shares its numeric identifier (60) with
+    ///   ``UserAuthPKOKMessage``. The two are disambiguated based on the authentication method
+    ///   currently in flight; see ``SSHPacketParser``.
+    struct UserAuthInfoRequestMessage: Equatable {
+        // SSH_MSG_USERAUTH_INFO_REQUEST
+        static let id: UInt8 = 60
+
+        /// The most prompts one request may carry. RFC 4256 sets no limit; OpenSSH's server
+        /// refuses more than 100 responses (`auth2-chall.c`), and the count is the peer's to choose.
+        static let maximumPrompts: UInt32 = 100
+
+        struct Prompt: Equatable {
+            var prompt: String
+            /// Whether the client should echo the user's response. `false` indicates a sensitive
+            /// value (such as a password) that must not be displayed.
+            var echo: Bool
+        }
+
+        var name: String
+        var instruction: String
+        var languageTag: String
+        var prompts: [Prompt]
+    }
+
+    /// SSH_MSG_USERAUTH_INFO_RESPONSE, sent by the client during RFC 4256 `keyboard-interactive`
+    /// authentication.
+    struct UserAuthInfoResponseMessage: Equatable {
+        // SSH_MSG_USERAUTH_INFO_RESPONSE
+        static let id: UInt8 = 61
+
+        var responses: [String]
     }
 
     struct GlobalRequestMessage: Equatable {
@@ -381,7 +426,14 @@ extension ByteBuffer {
     ///
     /// This function will consume as many bytes as the message should require. If it cannot read enough bytes,
     /// it will return nil.
-    mutating func readSSHMessage() throws -> SSHMessage? {
+    ///
+    /// - parameter keyboardInteractiveInfoRequestExpected: Message identifier 60 is overloaded in
+    ///   the SSH user-authentication protocol: it is `SSH_MSG_USERAUTH_PK_OK` when a public-key
+    ///   query is outstanding, but `SSH_MSG_USERAUTH_INFO_REQUEST` when a `keyboard-interactive`
+    ///   attempt is in flight. When this flag is `true`, identifier 60 is decoded as an info request.
+    mutating func readSSHMessage(
+        keyboardInteractiveInfoRequestExpected: Bool = false
+    ) throws -> SSHMessage? {
         try self.rewindOnNilOrError { `self` in
             guard let type = self.readInteger(as: UInt8.self) else {
                 return nil
@@ -453,10 +505,24 @@ extension ByteBuffer {
                 }
                 return .userAuthBanner(message)
             case SSHMessage.UserAuthPKOKMessage.id:
-                guard let message = try self.readUserAuthPKOKMessage() else {
+                // Identifier 60 is shared between SSH_MSG_USERAUTH_PK_OK and
+                // SSH_MSG_USERAUTH_INFO_REQUEST. Decode based on the in-flight auth method.
+                if keyboardInteractiveInfoRequestExpected {
+                    guard let message = try self.readUserAuthInfoRequestMessage() else {
+                        return nil
+                    }
+                    return .userAuthInfoRequest(message)
+                } else {
+                    guard let message = try self.readUserAuthPKOKMessage() else {
+                        return nil
+                    }
+                    return .userAuthPKOK(message)
+                }
+            case SSHMessage.UserAuthInfoResponseMessage.id:
+                guard let message = try self.readUserAuthInfoResponseMessage() else {
                     return nil
                 }
-                return .userAuthPKOK(message)
+                return .userAuthInfoResponse(message)
             case SSHMessage.GlobalRequestMessage.id:
                 guard let message = try self.readGlobalRequestMessage() else {
                     return nil
@@ -740,6 +806,15 @@ extension ByteBuffer {
 
                     method = .publicKey(.unknown)
                 }
+            case "keyboard-interactive":
+                guard
+                    let languageTag = self.readSSHStringAsString(),
+                    let submethods = self.readSSHStringAsString()
+                else {
+                    return nil
+                }
+
+                method = .keyboardInteractive(.init(languageTag: languageTag, submethods: submethods))
             default:
                 return nil
             }
@@ -797,6 +872,68 @@ extension ByteBuffer {
             }
 
             return .init(key: publicKey)
+        }
+    }
+
+    mutating func readUserAuthInfoRequestMessage() throws -> SSHMessage.UserAuthInfoRequestMessage? {
+        try self.rewindOnNilOrError { `self` in
+            guard
+                let name = self.readSSHStringAsString(),
+                let instruction = self.readSSHStringAsString(),
+                let languageTag = self.readSSHStringAsString(),
+                let numPrompts = self.readInteger(as: UInt32.self)
+            else {
+                return nil
+            }
+            // The count is the peer's: bound it before reserving anything for it.
+            guard numPrompts <= SSHMessage.UserAuthInfoRequestMessage.maximumPrompts else {
+                throw NIOSSHError.invalidSSHMessage(
+                    reason: "keyboard-interactive request with \(numPrompts) prompts"
+                )
+            }
+
+            var prompts = [SSHMessage.UserAuthInfoRequestMessage.Prompt]()
+            prompts.reserveCapacity(Int(numPrompts))
+            for _ in 0..<numPrompts {
+                guard
+                    let prompt = self.readSSHStringAsString(),
+                    let echo = self.readSSHBoolean()
+                else {
+                    return nil
+                }
+                prompts.append(.init(prompt: prompt, echo: echo))
+            }
+
+            return SSHMessage.UserAuthInfoRequestMessage(
+                name: name,
+                instruction: instruction,
+                languageTag: languageTag,
+                prompts: prompts
+            )
+        }
+    }
+
+    mutating func readUserAuthInfoResponseMessage() throws -> SSHMessage.UserAuthInfoResponseMessage? {
+        try self.rewindOnNilOrError { `self` in
+            guard let numResponses = self.readInteger(as: UInt32.self) else {
+                return nil
+            }
+            guard numResponses <= SSHMessage.UserAuthInfoRequestMessage.maximumPrompts else {
+                throw NIOSSHError.invalidSSHMessage(
+                    reason: "keyboard-interactive response with \(numResponses) answers"
+                )
+            }
+
+            var responses = [String]()
+            responses.reserveCapacity(Int(numResponses))
+            for _ in 0..<numResponses {
+                guard let response = self.readSSHStringAsString() else {
+                    return nil
+                }
+                responses.append(response)
+            }
+
+            return SSHMessage.UserAuthInfoResponseMessage(responses: responses)
         }
     }
 
@@ -1253,6 +1390,12 @@ extension ByteBuffer {
         case .userAuthPKOK(let message):
             writtenBytes += self.writeInteger(SSHMessage.UserAuthPKOKMessage.id)
             writtenBytes += self.writeUserAuthPKOKMessage(message)
+        case .userAuthInfoRequest(let message):
+            writtenBytes += self.writeInteger(SSHMessage.UserAuthInfoRequestMessage.id)
+            writtenBytes += self.writeUserAuthInfoRequestMessage(message)
+        case .userAuthInfoResponse(let message):
+            writtenBytes += self.writeInteger(SSHMessage.UserAuthInfoResponseMessage.id)
+            writtenBytes += self.writeUserAuthInfoResponseMessage(message)
         case .globalRequest(let message):
             writtenBytes += self.writeInteger(SSHMessage.GlobalRequestMessage.id)
             writtenBytes += self.writeGlobalRequestMessage(message)
@@ -1413,8 +1556,34 @@ extension ByteBuffer {
 
         case .publicKey(.unknown):
             preconditionFailure("We cannot write user auth request messages on unknown keys")
+        case .keyboardInteractive(let keyboardInteractive):
+            writtenBytes += self.writeSSHString("keyboard-interactive".utf8)
+            writtenBytes += self.writeSSHString(keyboardInteractive.languageTag.utf8)
+            writtenBytes += self.writeSSHString(keyboardInteractive.submethods.utf8)
         }
 
+        return writtenBytes
+    }
+
+    mutating func writeUserAuthInfoRequestMessage(_ message: SSHMessage.UserAuthInfoRequestMessage) -> Int {
+        var writtenBytes = 0
+        writtenBytes += self.writeSSHString(message.name.utf8)
+        writtenBytes += self.writeSSHString(message.instruction.utf8)
+        writtenBytes += self.writeSSHString(message.languageTag.utf8)
+        writtenBytes += self.writeInteger(UInt32(message.prompts.count))
+        for prompt in message.prompts {
+            writtenBytes += self.writeSSHString(prompt.prompt.utf8)
+            writtenBytes += self.writeSSHBoolean(prompt.echo)
+        }
+        return writtenBytes
+    }
+
+    mutating func writeUserAuthInfoResponseMessage(_ message: SSHMessage.UserAuthInfoResponseMessage) -> Int {
+        var writtenBytes = 0
+        writtenBytes += self.writeInteger(UInt32(message.responses.count))
+        for response in message.responses {
+            writtenBytes += self.writeSSHString(response.utf8)
+        }
         return writtenBytes
     }
 

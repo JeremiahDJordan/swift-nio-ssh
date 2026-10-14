@@ -1593,6 +1593,39 @@ final class SSHConnectionStateMachineTests: XCTestCase {
         }
     }
 
+    /// A keyboard-interactive answer the delegate completes after authentication has ended is
+    /// dropped: no bytes, and no error that would fail an authenticated connection.
+    func testStaleKeyboardInteractiveAnswerAfterAuthenticationIsDropped() throws {
+        let allocator = ByteBufferAllocator()
+        let loop = EmbeddedEventLoop()
+        var client = SSHConnectionStateMachine(
+            role: .client(
+                .init(userAuthDelegate: InfinitePasswordDelegate(), serverAuthDelegate: AcceptAllHostKeysDelegate())
+            )
+        )
+        var server = SSHConnectionStateMachine(
+            role: .server(
+                .init(
+                    hostKeys: [NIOSSHPrivateKey(ed25519Key: .init())],
+                    userAuthDelegate: DenyThenAcceptDelegate(messagesToDeny: 1)
+                )
+            )
+        )
+        try assertSuccessfulConnection(client: &client, server: &server, allocator: allocator, loop: loop)
+
+        var buffer = allocator.buffer(capacity: 64)
+        XCTAssertNoThrow(
+            try client.processOutboundMessage(
+                .userAuthInfoResponse(.init(responses: ["123456"])),
+                buffer: &buffer,
+                allocator: allocator,
+                loop: loop
+            )
+        )
+        XCTAssertEqual(buffer.readableBytes, 0)
+        try self.assertDataFlowsBothWays(client: &client, server: &server, allocator: allocator, loop: loop)
+    }
+
     func testUnimplementedGivesARichError() throws {
         let allocator = ByteBufferAllocator()
         let loop = EmbeddedEventLoop()

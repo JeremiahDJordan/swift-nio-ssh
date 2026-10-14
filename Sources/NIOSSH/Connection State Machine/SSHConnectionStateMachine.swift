@@ -347,6 +347,14 @@ struct SSHConnectionStateMachine {
             case .userAuthentication(var state):
                 do {
                     // In this state we tolerate receiving user auth messages.
+                    //
+                    // Message identifier 60 is overloaded: it is SSH_MSG_USERAUTH_INFO_REQUEST
+                    // during a keyboard-interactive attempt and SSH_MSG_USERAUTH_PK_OK otherwise.
+                    // Tell the parser which one to expect based on the authoritative auth state,
+                    // re-synced on every read so it is always correct regardless of write ordering.
+                    state.parser.keyboardInteractiveInfoRequestExpected =
+                        state.userAuthStateMachine.expectingKeyboardInteractiveInfoRequest
+
                     guard let message = try state.parser.nextPacket() else {
                         self = .userAuthentication(state)
                         return nil
@@ -370,7 +378,8 @@ struct SSHConnectionStateMachine {
 
                     case .userAuthSuccess:
                         let result = try state.receiveUserAuthSuccess()
-                        // Hey, auth succeeded!
+                        // Hey, auth succeeded! Identifier 60 means nothing from here on.
+                        state.parser.keyboardInteractiveInfoRequestExpected = false
                         self = .active(ActiveState(state))
                         return result
 
@@ -381,6 +390,11 @@ struct SSHConnectionStateMachine {
 
                     case .userAuthBanner(let message):
                         let result = try state.receiveUserAuthBanner(message)
+                        self = .userAuthentication(state)
+                        return result
+
+                    case .userAuthInfoRequest(let message):
+                        let result = try state.receiveUserAuthInfoRequest(message)
                         self = .userAuthentication(state)
                         return result
 
@@ -904,6 +918,15 @@ struct SSHConnectionStateMachine {
         allocator: ByteBufferAllocator,
         loop: EventLoop
     ) throws {
+        // The answer to a keyboard-interactive challenge comes from the delegate asynchronously
+        // (a person is typing). If user authentication has ended meanwhile, it is stale: drop it
+        // rather than send it, or fail the connection, after the attempt it answered.
+        if case .userAuthInfoResponse = message {
+            guard case .userAuthentication = self.state else {
+                return
+            }
+        }
+
         switch self.state {
         case .idle(var state):
             switch message {
@@ -1056,7 +1079,13 @@ struct SSHConnectionStateMachine {
                 self.state = .userAuthentication(state)
 
             case .userAuthRequest(let message):
+                // The parser is told how to decode the overloaded identifier 60 based on the auth
+                // state machine (see the inbound handler), so no parser bookkeeping is needed here.
                 try state.writeUserAuthRequest(message, into: &buffer)
+                self.state = .userAuthentication(state)
+
+            case .userAuthInfoResponse(let message):
+                try state.writeUserAuthInfoResponse(message, into: &buffer)
                 self.state = .userAuthentication(state)
 
             case .userAuthSuccess:

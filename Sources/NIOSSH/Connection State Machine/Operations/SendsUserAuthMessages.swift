@@ -63,4 +63,16 @@ extension SendsUserAuthMessages {
         self.userAuthStateMachine.sendUserAuthPKOK(message)
         try self.serializer.serialize(message: .userAuthPKOK(message), to: &buffer)
     }
+
+    /// Writes the answer to a keyboard-interactive challenge, unless the attempt it answers has
+    /// already ended (the answer is then stale and dropped; see `sendUserAuthInfoResponse`).
+    mutating func writeUserAuthInfoResponse(
+        _ message: SSHMessage.UserAuthInfoResponseMessage,
+        into buffer: inout ByteBuffer
+    ) throws {
+        guard self.userAuthStateMachine.sendUserAuthInfoResponse(message) else {
+            return
+        }
+        try self.serializer.serialize(message: .userAuthInfoResponse(message), to: &buffer)
+    }
 }

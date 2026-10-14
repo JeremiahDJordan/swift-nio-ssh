@@ -24,6 +24,17 @@ struct UserAuthenticationStateMachine {
     /// disconnecting. Taken from `SSHServerConfiguration`; `.max` for clients, which never enforce it.
     private let maxAuthAttempts: Int
 
+    /// Whether the most recently sent authentication request used the `keyboard-interactive` method.
+    ///
+    /// This is used to disambiguate message identifier 60, which the server may use for either
+    /// `SSH_MSG_USERAUTH_PK_OK` or `SSH_MSG_USERAUTH_INFO_REQUEST`. See
+    /// ``expectingKeyboardInteractiveInfoRequest``.
+    private var lastSentMethodWasKeyboardInteractive: Bool = false
+
+    /// Whether a keyboard-interactive challenge (SSH_MSG_USERAUTH_INFO_REQUEST) is waiting for the
+    /// delegate's answer. At most one is: RFC 4256 §3.2 has the server wait for the response.
+    private var infoRequestOutstanding: Bool = false
+
     init(role: SSHConnectionRole, loop: EventLoop, sessionID: ByteBuffer) {
         self.state = .idle
         self.delegate = UserAuthDelegate(role: role)
@@ -34,6 +45,23 @@ struct UserAuthenticationStateMachine {
             self.maxAuthAttempts = configuration.maxAuthAttempts ?? Constants.defaultMaxAuthAttempts
         case .client:
             self.maxAuthAttempts = .max
+        }
+    }
+
+    /// Whether an inbound message with identifier 60 should be decoded as
+    /// `SSH_MSG_USERAUTH_INFO_REQUEST` (rather than `SSH_MSG_USERAUTH_PK_OK`).
+    ///
+    /// This is `true` exactly when the client is awaiting the outcome of a `keyboard-interactive`
+    /// authentication attempt. Deriving it from the authoritative auth state (rather than setting it
+    /// speculatively when a request is written) means the packet parser is always told how to
+    /// interpret identifier 60 correctly, independent of any ordering between writes and reads.
+    var expectingKeyboardInteractiveInfoRequest: Bool {
+        switch self.state {
+        case .awaitingResponses:
+            return self.lastSentMethodWasKeyboardInteractive
+        case .idle, .awaitingServiceAcceptance, .awaitingNextRequest, .authenticationSucceeded,
+            .authenticationFailed:
+            return false
         }
     }
 
@@ -121,9 +149,11 @@ extension UserAuthenticationStateMachine {
                 )
             }
 
-            // Cool, we can begin the auth dance.
+            // Cool, we can begin the auth dance. We haven't been told which methods the server
+            // accepts yet, so we optimistically offer the full set the client can drive (including
+            // keyboard-interactive). The server will tell us what it really accepts if it rejects us.
             self.state = .awaitingNextRequest(attempts: 0)
-            return self.requestNextAuthRequest(methods: .all, delegate: delegate)
+            return self.requestNextAuthRequest(methods: .all.union(.keyboardInteractive), delegate: delegate)
         case (.client, .authenticationSucceeded):
             // We should ignore all further auth messages in this state.
             return nil
@@ -208,6 +238,8 @@ extension UserAuthenticationStateMachine {
         switch (self.delegate, self.state) {
         case (.client, .awaitingResponses):
             // Great, we got a response, and it's a success! Disregard all future responses
+            // (including the answer to a keyboard-interactive challenge still with the delegate).
+            self.infoRequestOutstanding = false
             self.state = .authenticationSucceeded
         case (.client, .authenticationSucceeded):
             // We should ignore all further auth messages in this state.
@@ -238,7 +270,9 @@ extension UserAuthenticationStateMachine {
     ) throws -> EventLoopFuture<SSHMessage.UserAuthRequestMessage?>? {
         switch (self.delegate, self.state) {
         case (.client(let delegate), .awaitingResponses(let attempts, let responseCount)):
-            // Ok, the server didn't like that much. Let's try another one.
+            // Ok, the server didn't like that much. Let's try another one. An answer to a
+            // keyboard-interactive challenge still with the delegate is now stale, and dropped.
+            self.infoRequestOutstanding = false
             self.state = .awaitingNextRequest(attempts: attempts)
             precondition(responseCount == 1, "We don't support parallel authentication attempts yet!")
             return self.requestNextAuthRequest(methods: .init(message), delegate: delegate)
@@ -262,6 +296,53 @@ extension UserAuthenticationStateMachine {
             throw NIOSSHError.protocolViolation(
                 protocolName: Self.protocolName,
                 violation: "client sent user auth failure"
+            )
+        }
+    }
+
+    /// A UserAuthInfoRequest message (a keyboard-interactive challenge) was received from the server.
+    mutating func receiveUserAuthInfoRequest(
+        _ message: SSHMessage.UserAuthInfoRequestMessage
+    ) throws -> EventLoopFuture<SSHMessage.UserAuthInfoResponseMessage?>? {
+        switch (self.delegate, self.state) {
+        case (.client(let delegate), .awaitingResponses):
+            // A keyboard-interactive attempt may involve any number of challenge/response rounds.
+            // We remain in `.awaitingResponses` throughout: the server will eventually send a
+            // success or failure to conclude the attempt. The parser only decodes identifier 60
+            // as an info request during a keyboard-interactive attempt, but check anyway.
+            guard self.lastSentMethodWasKeyboardInteractive else {
+                throw NIOSSHError.protocolViolation(
+                    protocolName: Self.protocolName,
+                    violation: "keyboard-interactive info request outside a keyboard-interactive attempt"
+                )
+            }
+            // RFC 4256 §3.2: the server waits for the response before it sends another challenge.
+            guard !self.infoRequestOutstanding else {
+                throw NIOSSHError.protocolViolation(
+                    protocolName: Self.protocolName,
+                    violation: "keyboard-interactive info request before the previous one was answered"
+                )
+            }
+            self.infoRequestOutstanding = true
+            return self.requestKeyboardInteractiveResponse(request: message, delegate: delegate)
+        case (.client, .authenticationSucceeded):
+            // We should ignore all further auth messages in this state.
+            return nil
+        case (.client, .idle), (.client, .awaitingServiceAcceptance):
+            throw NIOSSHError.protocolViolation(
+                protocolName: Self.protocolName,
+                violation: "server sent keyboard-interactive info request unprompted"
+            )
+        case (.client, .awaitingNextRequest), (.client, .authenticationFailed):
+            throw NIOSSHError.protocolViolation(
+                protocolName: Self.protocolName,
+                violation: "unsolicited keyboard-interactive info request"
+            )
+        case (.server, _):
+            // Servers may never receive info request messages.
+            throw NIOSSHError.protocolViolation(
+                protocolName: Self.protocolName,
+                violation: "client sent keyboard-interactive info request"
             )
         }
     }
@@ -324,9 +405,17 @@ extension UserAuthenticationStateMachine {
         }
     }
 
-    mutating func sendUserAuthRequest(_: SSHMessage.UserAuthRequestMessage) {
+    mutating func sendUserAuthRequest(_ message: SSHMessage.UserAuthRequestMessage) {
         switch (self.delegate, self.state) {
         case (.client, .awaitingNextRequest(let attempts)):
+            // Record whether this attempt is keyboard-interactive so we can correctly decode a
+            // server response carrying the overloaded message identifier 60.
+            if case .keyboardInteractive = message.method {
+                self.lastSentMethodWasKeyboardInteractive = true
+            } else {
+                self.lastSentMethodWasKeyboardInteractive = false
+            }
+            self.infoRequestOutstanding = false
             self.state = .awaitingResponses(attempts: attempts, pending: 1)
         case (.client, .idle),
             (.client, .awaitingServiceAcceptance):
@@ -342,6 +431,26 @@ extension UserAuthenticationStateMachine {
             preconditionFailure("Attempted to send a user auth request after auth failed")
         case (.server, _):
             // Servers may never send user auth request messages.
+            preconditionFailure("Servers may not authenticate")
+        }
+    }
+
+    /// Records that the answer to the outstanding keyboard-interactive challenge is being sent.
+    ///
+    /// - returns: whether to send it. The delegate answers asynchronously (a person is typing), and
+    ///     the server may end the attempt meanwhile, with a failure or a success; such an answer is
+    ///     stale and must be dropped, never sent into the next attempt or after authentication.
+    mutating func sendUserAuthInfoResponse(_: SSHMessage.UserAuthInfoResponseMessage) -> Bool {
+        switch (self.delegate, self.state) {
+        case (.client, .awaitingResponses) where self.infoRequestOutstanding:
+            // We're responding to a keyboard-interactive challenge. We stay in `.awaitingResponses`:
+            // the server may send further challenges, or conclude with success/failure.
+            self.infoRequestOutstanding = false
+            return true
+        case (.client, _):
+            return false
+        case (.server, _):
+            // Servers may never send info response messages.
             preconditionFailure("Servers may not authenticate")
         }
     }
@@ -475,6 +584,25 @@ extension UserAuthenticationStateMachine {
             try request.map { try SSHMessage.UserAuthRequestMessage(request: $0, sessionID: sessionID) }
         }
     }
+
+    fileprivate func requestKeyboardInteractiveResponse(
+        request: SSHMessage.UserAuthInfoRequestMessage,
+        delegate: NIOSSHClientUserAuthenticationDelegate
+    ) -> EventLoopFuture<SSHMessage.UserAuthInfoResponseMessage?> {
+        let challenge = NIOSSHKeyboardInteractiveChallenge(request)
+        let promise = self.loop.makePromise(of: [String].self)
+        delegate.respondToKeyboardInteractiveChallenge(challenge, responsePromise: promise)
+
+        let expectedResponses = request.prompts.count
+        return promise.futureResult.flatMapThrowing { responses in
+            guard responses.count == expectedResponses else {
+                throw NIOSSHError.invalidKeyboardInteractiveResponse(
+                    "expected \(expectedResponses) response(s), delegate provided \(responses.count)"
+                )
+            }
+            return SSHMessage.UserAuthInfoResponseMessage(responses: responses)
+        }
+    }
 }
 
 // MARK: Interacting with server delegate
@@ -536,6 +664,13 @@ extension UserAuthenticationStateMachine {
 
         case .publicKey(.unknown):
             // We don't known the algorithm, the auth attempt has failed.
+            return self.loop.makeSucceededFuture(
+                .failure(.init(authentications: delegate.supportedAuthenticationMethods.strings, partialSuccess: false))
+            )
+
+        case .keyboardInteractive:
+            // Server-side keyboard-interactive authentication is not implemented. Reject the
+            // attempt by reporting the methods we do support, so the client can try another.
             return self.loop.makeSucceededFuture(
                 .failure(.init(authentications: delegate.supportedAuthenticationMethods.strings, partialSuccess: false))
             )

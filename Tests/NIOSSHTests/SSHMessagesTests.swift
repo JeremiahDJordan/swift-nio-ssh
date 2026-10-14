@@ -882,7 +882,7 @@ final class SSHMessagesTests: XCTestCase {
         // Every type byte this implementation has no parser for, and only those, comes back
         // as `.unrecognized` carrying that byte.
         let known: Set<UInt8> = [
-            1, 2, 3, 4, 5, 6, 20, 21, 30, 31, 50, 51, 52, 53, 60, 80, 81, 82,
+            1, 2, 3, 4, 5, 6, 20, 21, 30, 31, 50, 51, 52, 53, 60, 61, 80, 81, 82,
             90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100,
         ]
         for type in UInt8.min...UInt8.max where !known.contains(type) {
@@ -918,5 +918,179 @@ final class SSHMessagesTests: XCTestCase {
             XCTFail("Parser state corrupted after unknown message type - expected channelSuccess")
             return
         }
+    }
+
+    // MARK: - Keyboard-interactive (RFC 4256)
+
+    func testUserAuthRequestKeyboardInteractive() throws {
+        var buffer = ByteBufferAllocator().buffer(capacity: 100)
+        let message = SSHMessage.userAuthRequest(
+            .init(
+                username: "test",
+                service: "ssh-connection",
+                method: .keyboardInteractive(.init(languageTag: "", submethods: ""))
+            )
+        )
+
+        buffer.writeSSHMessage(message)
+        XCTAssertEqual(try buffer.readSSHMessage(), message)
+
+        try self.assertCorrectlyManagesPartialRead(message)
+    }
+
+    func testUserAuthRequestKeyboardInteractiveWithSubmethods() throws {
+        var buffer = ByteBufferAllocator().buffer(capacity: 100)
+        let message = SSHMessage.userAuthRequest(
+            .init(
+                username: "test",
+                service: "ssh-connection",
+                method: .keyboardInteractive(.init(languageTag: "en-US", submethods: "otp,password"))
+            )
+        )
+
+        buffer.writeSSHMessage(message)
+        XCTAssertEqual(try buffer.readSSHMessage(), message)
+
+        try self.assertCorrectlyManagesPartialRead(message)
+    }
+
+    func testUserAuthInfoRequestZeroPrompts() throws {
+        var buffer = ByteBufferAllocator().buffer(capacity: 100)
+        let message = SSHMessage.userAuthInfoRequest(
+            .init(name: "", instruction: "", languageTag: "", prompts: [])
+        )
+
+        buffer.writeSSHMessage(message)
+        // Identifier 60 is overloaded, so decoding an info request requires the context flag.
+        XCTAssertEqual(
+            try buffer.readSSHMessage(keyboardInteractiveInfoRequestExpected: true),
+            message
+        )
+    }
+
+    func testUserAuthInfoRequestSinglePrompt() throws {
+        var buffer = ByteBufferAllocator().buffer(capacity: 100)
+        let message = SSHMessage.userAuthInfoRequest(
+            .init(
+                name: "PAM Authentication",
+                instruction: "Please enter your credentials",
+                languageTag: "",
+                prompts: [.init(prompt: "Password: ", echo: false)]
+            )
+        )
+
+        buffer.writeSSHMessage(message)
+        XCTAssertEqual(
+            try buffer.readSSHMessage(keyboardInteractiveInfoRequestExpected: true),
+            message
+        )
+    }
+
+    func testUserAuthInfoRequestMultiplePrompts() throws {
+        var buffer = ByteBufferAllocator().buffer(capacity: 100)
+        let message = SSHMessage.userAuthInfoRequest(
+            .init(
+                name: "Two-factor",
+                instruction: "Complete both steps",
+                languageTag: "en-US",
+                prompts: [
+                    .init(prompt: "Password: ", echo: false),
+                    .init(prompt: "Verification code: ", echo: false),
+                    .init(prompt: "Username confirmation: ", echo: true),
+                ]
+            )
+        )
+
+        buffer.writeSSHMessage(message)
+        let decoded = try buffer.readSSHMessage(keyboardInteractiveInfoRequestExpected: true)
+        XCTAssertEqual(decoded, message)
+
+        // Partial reads must return nil and preserve the reader index.
+        var partial = ByteBufferAllocator().buffer(capacity: 100)
+        partial.writeSSHMessage(message)
+        let messageBytes = partial.readableBytesView[...]
+        partial.clear()
+        for byte in messageBytes.dropLast() {
+            partial.writeInteger(byte)
+            XCTAssertNil(try partial.readSSHMessage(keyboardInteractiveInfoRequestExpected: true))
+        }
+        partial.writeInteger(messageBytes.last!)
+        XCTAssertEqual(try partial.readSSHMessage(keyboardInteractiveInfoRequestExpected: true), message)
+    }
+
+    func testIdentifier60DecodesAsPKOKWithoutContext() throws {
+        // Without the keyboard-interactive context, identifier 60 must still decode as PK_OK.
+        var buffer = ByteBufferAllocator().buffer(capacity: 100)
+        let key = NIOSSHPrivateKey(ed25519Key: .init())
+        let message = SSHMessage.userAuthPKOK(.init(key: key.publicKey))
+
+        buffer.writeSSHMessage(message)
+        XCTAssertEqual(try buffer.readSSHMessage(), message)
+    }
+
+    func testUserAuthInfoResponseZeroResponses() throws {
+        var buffer = ByteBufferAllocator().buffer(capacity: 100)
+        let message = SSHMessage.userAuthInfoResponse(.init(responses: []))
+
+        buffer.writeSSHMessage(message)
+        XCTAssertEqual(try buffer.readSSHMessage(), message)
+
+        try self.assertCorrectlyManagesPartialRead(message)
+    }
+
+    func testUserAuthInfoResponseMultipleResponses() throws {
+        var buffer = ByteBufferAllocator().buffer(capacity: 100)
+        let message = SSHMessage.userAuthInfoResponse(.init(responses: ["hunter2", "123456", ""]))
+
+        buffer.writeSSHMessage(message)
+        XCTAssertEqual(try buffer.readSSHMessage(), message)
+
+        try self.assertCorrectlyManagesPartialRead(message)
+    }
+
+    /// The prompt and answer counts are the peer's: a huge one is refused before anything is
+    /// reserved for it (the PR reserved capacity for up to 2^32 - 1 prompts).
+    func testKeyboardInteractiveCountsAreBounded() throws {
+        for count: UInt32 in [101, .max] {
+            var request = ByteBuffer()
+            request.writeInteger(SSHMessage.UserAuthInfoRequestMessage.id)
+            request.writeSSHString("".utf8)
+            request.writeSSHString("".utf8)
+            request.writeSSHString("".utf8)
+            request.writeInteger(count)
+            XCTAssertThrowsError(try request.readSSHMessage(keyboardInteractiveInfoRequestExpected: true)) { error in
+                XCTAssertEqual((error as? NIOSSHError)?.type, .invalidSSHMessage)
+            }
+
+            var response = ByteBuffer()
+            response.writeInteger(SSHMessage.UserAuthInfoResponseMessage.id)
+            response.writeInteger(count)
+            XCTAssertThrowsError(try response.readSSHMessage()) { error in
+                XCTAssertEqual((error as? NIOSSHError)?.type, .invalidSSHMessage)
+            }
+        }
+
+        // 100 is accepted.
+        let prompts = Array(repeating: SSHMessage.UserAuthInfoRequestMessage.Prompt(prompt: "p", echo: true), count: 100)
+        let message = SSHMessage.userAuthInfoRequest(.init(name: "", instruction: "", languageTag: "", prompts: prompts))
+        var buffer = ByteBuffer()
+        buffer.writeSSHMessage(message)
+        XCTAssertEqual(try buffer.readSSHMessage(keyboardInteractiveInfoRequestExpected: true), message)
+    }
+
+    func testAvailableMethodsParseKeyboardInteractive() throws {
+        let failure = SSHMessage.UserAuthFailureMessage(
+            authentications: ["password", "keyboard-interactive"],
+            partialSuccess: false
+        )
+        let methods = NIOSSHAvailableUserAuthenticationMethods(failure)
+        XCTAssertTrue(methods.contains(.keyboardInteractive))
+        XCTAssertTrue(methods.contains(.password))
+        XCTAssertFalse(methods.contains(.publicKey))
+    }
+
+    func testAvailableMethodsSerializeKeyboardInteractive() throws {
+        let methods: NIOSSHAvailableUserAuthenticationMethods = [.keyboardInteractive]
+        XCTAssertEqual(methods.strings, ["keyboard-interactive"])
     }
 }
