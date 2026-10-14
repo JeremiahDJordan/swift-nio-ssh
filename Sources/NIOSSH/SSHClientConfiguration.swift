@@ -92,14 +92,21 @@ public struct SSHClientConfiguration {
 /// the count. When `maximumUnansweredProbes` probes are unanswered at the next quiet interval, the
 /// handler fires ``NIOSSHError/ErrorType/keepAliveTimeout`` and closes the connection: a dead peer
 /// is noticed after about `interval × (maximumUnansweredProbes + 1)` of silence.
+///
+/// A server must answer the probe with `SSH_MSG_REQUEST_FAILURE` (RFC 4254 §4); one that answers
+/// with `SSH_MSG_UNIMPLEMENTED` instead fails the connection (`remotePeerDoesNotSupportMessage`),
+/// as any `SSH_MSG_UNIMPLEMENTED` does in NIOSSH. OpenSSH and every other server tested answer
+/// `SSH_MSG_REQUEST_FAILURE`.
 public struct SSHKeepAliveConfiguration: Hashable, Sendable {
-    /// The quiet time before a probe is sent, and between probes. Must be positive.
-    public var interval: TimeAmount
+    /// The quiet time before a probe is sent, and between probes. Positive.
+    public let interval: TimeAmount
 
     /// The number of unanswered probes tolerated; the next quiet interval closes the connection.
-    /// Must be at least 1.
-    public var maximumUnansweredProbes: Int
+    /// At least 1.
+    public let maximumUnansweredProbes: Int
 
+    /// - Precondition: `interval` is positive and `maximumUnansweredProbes` at least 1. A caller
+    ///     taking these from user settings clamps them first.
     public init(interval: TimeAmount, maximumUnansweredProbes: Int = 3) {
         precondition(interval > .zero, "keepalive interval must be positive")
         precondition(maximumUnansweredProbes >= 1, "keepalive must tolerate at least one unanswered probe")

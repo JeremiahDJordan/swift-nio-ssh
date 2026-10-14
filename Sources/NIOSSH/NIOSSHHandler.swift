@@ -251,6 +251,11 @@ extension NIOSSHHandler: ChannelDuplexHandler {
                         try self.writeMessage(message, context: context)
                         self.pendingWrite = false
                         context.flush()
+                        // This write may have completed a key exchange (our NEWKEYS after an
+                        // asynchronous host key check), making the connection active again: send
+                        // what waited for that, or it waits for the server's next packet.
+                        self.createPendingChannelsIfPossible()
+                        self.sendGlobalRequestsIfPossible()
                     } catch {
                         context.fireErrorCaught(error)
                     }
@@ -585,7 +590,7 @@ extension NIOSSHHandler {
     private func keepAliveCheckDue() {
         self.keepAliveCheck = nil
         guard let context = self.context, let configuration = self.keepAliveConfiguration,
-            !self.stateMachine.disconnected
+            context.channel.isActive, !self.stateMachine.disconnected
         else {
             return
         }
@@ -603,6 +608,10 @@ extension NIOSSHHandler {
         }
         self.unansweredKeepAlives += 1
         self.sendKeepAlive(promise: nil)
+        // Sending can fail the channel synchronously; do not re-arm after `channelInactive`.
+        guard context.channel.isActive else {
+            return
+        }
         self.scheduleKeepAliveCheck(at: now + configuration.interval, context: context)
     }
 
